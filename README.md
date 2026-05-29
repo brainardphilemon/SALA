@@ -37,31 +37,8 @@ Hallucination-Detection/
 │   └── helpers.py         # Data processing, metric evaluation (AUC), and random seeds
 ├── main.py                # Main experiment pipeline
 └── README.md
-
-
-没问题，图先放一边，什么时候改顺手了随时解开注释就行。我们一鼓作气，直接把 README 剩下的核心板块（结构、环境、数据、运行、引用）全部拼装完成！
-
-这是你 `README.md` 的下半部分。我把咱们刚才定好的“免责版数据准备”、精简版的代码结构以及运行命令全都整合进去了。你可以直接把这段接在刚才那段简介的后面：
-
-```markdown
-## 📂 Repository Structure
-
-The codebase has been refactored and modularized for clarity:
-
-```text
-Hallucination-Detection/
-├── configs/
-│   └── mappings.py        # Generalization experiment settings & domain mappings
-├── models/
-│   ├── isr.py             # Core Invariant Subspace Risk minimization (ISR) module
-│   ├── projections.py     # Layer-wise projection training and initialization
-│   └── classifiers.py     # MLP classifiers and Adaptive Layer Aggregation (ALA)
-├── utils/
-│   └── helpers.py         # Data processing, metric evaluation (AUC), and random seeds
-├── main.py                # Main experiment pipeline
-└── README.md              
-
 ```
+
 
 ## ⚙️ Environment Setup
 
