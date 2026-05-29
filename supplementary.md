@@ -16,28 +16,32 @@ Importantly, despite these fluctuations, the sweep consistently stays above the 
 <p align="center">
   <img src="assets/figures/sweep_heatmap_13.png" alt="Heatmap TruthfulQA" width="70%">
 </p>
-<em><b>Figure 1.1:</b> Heatmap of test-domain AUROC over the sweep of the separation weight $\lambda_s$ and the regularization weight $\lambda_a$ (with $\lambda_v$ fixed). Higher values indicate better cross-domain performance.</em>
+
+_**Figure 1.1:** Heatmap of test-domain AUROC over the sweep of the separation weight $\lambda_s$ and the regularization weight $\lambda_a$ (with $\lambda_v$ fixed). Higher values indicate better cross-domain performance._
 
 **Sensitivity to $\lambda_a$ (fixed $\lambda_s$)** The results exhibit a non-monotonic dependence on the regularization weight $\lambda_a$. Across multiple fixed $\lambda_s$ values, moving from zero to a small-to-moderate $\lambda_a$ improves the AUROC, while overly strong regularization degrades performance. Crucially, this degradation is gradual rather than catastrophic; the curves bend downward smoothly without collapsing. This pattern supports a practical tuning strategy using a coarse grid over $\lambda_a$, as moderate misspecification still preserves the performance gains over the best baseline.
 
 <p align="center">
   <img src="assets/figures/sweep_slice_vs_reg_13.png" alt="Slice vs reg TruthfulQA" width="70%">
 </p>
-<em><b>Figure 1.2:</b> One-dimensional slices of the sweep showing AUROC changes as a function of $\lambda_a$.</em>
+
+_**Figure 1.2:** One-dimensional slices of the sweep showing AUROC changes as a function of $\lambda_a$._
 
 **Sensitivity to $\lambda_s$ (fixed $\lambda_a$)** Similarly, increasing the separation weight $\lambda_s$ yields non-monotonic effects. The optimal $\lambda_s$ relies on the chosen $\lambda_a$: for a moderate $\lambda_a$, a larger $\lambda_s$ is beneficial, whereas at extreme values of $\lambda_a$, the optimum shifts toward an intermediate $\lambda_s$. The curves around their maxima are relatively flat, implying a reasonably wide robust range for $\lambda_s$. The performance consistently exceeds the best baseline, confirming that the method is not overly brittle to tuning errors.
 
 <p align="center">
   <img src="assets/figures/sweep_slice_vs_sep_13.png" alt="Slice vs sep TruthfulQA" width="70%">
 </p>
-<em><b>Figure 1.3:</b> One-dimensional slices of the sweep showing AUROC changes as a function of $\lambda_s$.</em>
+
+_**Figure 1.3:** One-dimensional slices of the sweep showing AUROC changes as a function of $\lambda_s$._
 
 **Top-performing Configurations** To further quantify the concentration of the optimum, we evaluate the top-10 hyperparameter settings. The best configuration achieves an AUROC of 0.8038 at $(\lambda_s, \lambda_a) = (0.4, 0.05)$, with several nearby configurations yielding comparable results (e.g., $(0.4, 0.1)$ and $(0.4, 0)$). The tail of the top-10 list maintains strong performance, indicating that the optimum is not an isolated spike. These results suggest that tuning primarily refines performance within an already robust regime; the gains are stable and do not hinge on a fragile configuration.
 
 <p align="center">
   <img src="assets/figures/sweep_top10_13.png" alt="Top 10 TruthfulQA" width="70%">
 </p>
-<em><b>Figure 1.4:</b> The top-10 hyperparameter configurations from the sweep, ranked by test-domain AUROC on TruthfulQA.</em>
+
+_**Figure 1.4:** The top-10 hyperparameter configurations from the sweep, ranked by test-domain AUROC on TruthfulQA._
 
 ---
 
@@ -52,7 +56,8 @@ To demonstrate that our sensitivity observations generalize beyond a single data
 <p align="center">
   <img src="assets/figures/sweep_slice_vs_sep_15.png" alt="Slice vs sep NQ Open" width="45%">
 </p>
-<em><b>Figure 1.5:</b> (Top Left) Test-domain AUROC on NQ Open over a grid of $(\lambda_s, \lambda_a)$. (Top Right & Bottom) Corresponding one-dimensional slices of the sweep.</em>
+
+_**Figure 1.5:** (Top Left) Test-domain AUROC on NQ Open over a grid of $(\lambda_s, \lambda_a)$. (Top Right & Bottom) Corresponding one-dimensional slices of the sweep._
 
 Overall, these supplementary results corroborate that the proposed method is resilient to moderate hyperparameter misspecification.
 
@@ -62,22 +67,22 @@ Overall, these supplementary results corroborate that the proposed method is res
 ### 2.1 Layer-wise Probing Performance (In-Domain)
 
 <div align="center">
-  <img src="../assets/figures/math_layerwise_in_domain_auroc_bars.png" width="48%" />
-  <img src="../assets/figures/theoremqa_layerwise_in_domain_auroc_bars.png" width="48%" />
+  <img src="assets/figures/math_layerwise_in_domain_auroc_bars.png" width="48%" />
+  <img src="assets/figures/theoremqa_layerwise_in_domain_auroc_bars.png" width="48%" />
   <br>
-  <img src="../assets/figures/mgsm_layerwise_in_domain_auroc_bars.png" width="48%" />
-  <img src="../assets/figures/SVAMP_layerwise_in_domain_auroc_bars.png" width="48%" />
+  <img src="assets/figures/mgsm_layerwise_in_domain_auroc_bars.png" width="48%" />
+  <img src="assets/figures/SVAMP_layerwise_in_domain_auroc_bars.png" width="48%" />
 </div>
 
-> **Figure 2.1: Layer-wise probing performance varies substantially across domains.** For each mathematical dataset, we train a linear probe at each Transformer layer for hallucination detection and report the in-domain AUROC. This in-domain probing exhibits *layer-index shift*: the layer that achieves the best in-domain performance changes markedly across datasets, suggesting that there is no single probing layer that is consistently optimal.
+> _**Figure 2.1: Layer-wise probing performance varies substantially across domains.**_ For each mathematical dataset, we train a linear probe at each Transformer layer for hallucination detection and report the in-domain AUROC. This in-domain probing exhibits *layer-index shift*: the layer that achieves the best in-domain performance changes markedly across datasets, suggesting that there is no single probing layer that is consistently optimal.
 
 <br>
 
 <div align="center">
-  <img src="../assets/figures/indomain_best_layer_bars_7datasets.png" width="80%" />
+  <img src="assets/figures/indomain_best_layer_bars_7datasets.png" width="80%" />
 </div>
 
-> **Figure 2.2: Layer-index shift in the in-domain case.** For each domain, we report the layer index that attains the highest in-domain AUROC, showing that the best-separable layer varies across domains rather than concentrating at a fixed layer.
+> _**Figure 2.2: Layer-index shift in the in-domain case.**_ For each domain, we report the layer index that attains the highest in-domain AUROC, showing that the best-separable layer varies across domains rather than concentrating at a fixed layer.
 
 
 ---
@@ -87,16 +92,16 @@ Overall, these supplementary results corroborate that the proposed method is res
 In the following figures, we visualize our layer-wise dimension scoring function and show that, in most cases, it selects dimensions that closely match the empirically optimal choices.
 
 <div align="center">
-  <img src="../assets/figures/layer00_tradeoff.png" width="48%" />
-  <img src="../assets/figures/layer10_tradeoff.png" width="48%" />
+  <img src="assets/figures/layer00_tradeoff.png" width="48%" />
+  <img src="assets/figures/layer10_tradeoff.png" width="48%" />
   <p><b>Left:</b> Layer 1. <b>Right:</b> Layer 11.</p>
   
-  <img src="../assets/figures/layer11_tradeoff.png" width="48%" />
-  <img src="../assets/figures/layer23_tradeoff.png" width="48%" />
+  <img src="assets/figures/layer11_tradeoff.png" width="48%" />
+  <img src="assets/figures/layer23_tradeoff.png" width="48%" />
   <p><b>Left:</b> Layer 12. <b>Right:</b> Layer 24.</p>
 </div>
 
-> **Figure 2.3:** Proxy score and test AUROC across dimensions $d$, with $d^*$ and $d^\dagger$ indicated by vertical markers.
+> _**Figure 2.3:**_ Proxy score and test AUROC across dimensions $d$, with $d^*$ and $d^\dagger$ indicated by vertical markers.
 
 
 ---
@@ -104,22 +109,22 @@ In the following figures, we visualize our layer-wise dimension scoring function
 ### 2.3 Cross-Domain Probing and Layer-Index Shift
 
 <div align="center">
-  <img src="../assets/figures/bars_train_math.png" width="48%" />
-  <img src="../assets/figures/bars_train_SVAMP.png" width="48%" />
+  <img src="assets/figures/bars_train_math.png" width="48%" />
+  <img src="assets/figures/bars_train_SVAMP.png" width="48%" />
   <br>
-  <img src="../assets/figures/bars_train_mgsm.png" width="48%" />
-  <img src="../assets/figures/bars_train_theoremqa.png" width="48%" />
+  <img src="assets/figures/bars_train_mgsm.png" width="48%" />
+  <img src="assets/figures/bars_train_theoremqa.png" width="48%" />
 </div>
 
-> **Figure 2.4: Cross-domain probing exhibits "layer-index shift" on four mathematical benchmarks (no universal best layer).** Each subplot trains a linear probe for hallucination detection on one training domain (title) and evaluates it on the remaining test domains (y-axis).
+> _**Figure 2.4: Cross-domain probing exhibits "layer-index shift" on four mathematical benchmarks (no universal best layer).**_ Each subplot trains a linear probe for hallucination detection on one training domain (title) and evaluates it on the remaining test domains (y-axis).
 
 <br>
 
 <div align="center">
-  <img src="../assets/figures/cross_domain_4panel_qa.png" width="90%" />
+  <img src="assets/figures/cross_domain_4panel_qa.png" width="90%" />
 </div>
 
-> **Figure 2.5: Cross-domain layer-index shift.** The figure contains four panels, each trained on a different training domain (shown in the panel title). Within each panel, the x-axis enumerates the three held-out test domains and the y-axis indexes transformer layers. Each cell reports the AUROC obtained by a model trained on the training domain at the corresponding layer and evaluated on the given test domain.
+> _**Figure 2.5: Cross-domain layer-index shift.**_ The figure contains four panels, each trained on a different training domain (shown in the panel title). Within each panel, the x-axis enumerates the three held-out test domains and the y-axis indexes transformer layers. Each cell reports the AUROC obtained by a model trained on the training domain at the corresponding layer and evaluated on the given test domain.
 
 
 
