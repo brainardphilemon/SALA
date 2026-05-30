@@ -27,7 +27,7 @@ The method addresses the **layer-index shift** phenomenon by learning layer-spec
 ## Repository Structure
 
 ```text
-Hallucination-Detection/
+SALA/
 ├── configs/
 │   └── mappings.py        # Generalization settings and source/target domain mappings
 ├── models/
@@ -50,25 +50,27 @@ We recommend using a virtual environment such as Conda.
 
 The projection and detector-training stages can be reproduced on a single GPU. We recommend a GPU with at least 24GB VRAM, such as an NVIDIA A40, A100, or comparable device, depending on the number of layers, domains, and cached feature size.
 
-### Core Dependencies
-
-* Python >= 3.8
-* PyTorch >= 2.0
-* NumPy
-* scikit-learn
-* tqdm
+### Installation
 
 ```bash
 # Clone the repository
 git clone https://github.com/Nellie179/SALA.git
 cd SALA
 
-# Install basic requirements
-pip install torch torchvision torchaudio
-pip install numpy scikit-learn tqdm
+# Create and activate a virtual environment
+conda create -n sala python=3.9
+conda activate sala
+
+# Install dependencies
+pip install -r requirements.txt
 ```
 
-A complete `requirements.txt` file will be provided with the final release.
+If PyTorch installation fails due to CUDA-version mismatch, please install PyTorch following the official instruction for your CUDA version, and then rerun:
+
+```bash
+pip install -r requirements.txt
+```
+
 
 ## Data Preparation
 
