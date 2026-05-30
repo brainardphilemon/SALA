@@ -253,7 +253,15 @@ We first state a basic auxiliary lemma:
 First, we decompose $`|R_{d_{\ell}}^e-R_{d_{\ell}}^{e'}|`$ to $`|M_{d_{\ell}}^e-M_{d_{\ell}}^{e'}|`$ and $`|V_{d_{\ell}}^e-V_{d_{\ell}}^{e'}|`$. Define $`g(M,V)=M^2/(M^2+V)`$, so that $`R_{d_{\ell}}^e=g(M_{d_{\ell}}^e,V_{d_{\ell}}^e)`$. On the region $`M^2+V>0`$, $`g`$ is continuously differentiable with:
 
 $$
-\begin{aligned}\frac{\partial g}{\partial M}(M,V)&=\frac{2MV}{(M^2+V)^2}\\\frac{\partial g}{\partial V}(M,V)&=-\frac{M^2}{(M^2+V)^2}\end{aligned}
+\begin{aligned}
+\frac{\partial g}{\partial M}(M,V)
+&=
+\frac{2MV}{(M^2+V)^2},
+\\
+\frac{\partial g}{\partial V}(M,V)
+&=
+-\frac{M^2}{(M^2+V)^2}.
+\end{aligned}
 $$
 
 By the multivariate mean value theorem, there exists $`(\tilde M_{d_{\ell}},\tilde V_{d_{\ell}})`$ lying on the line segment connecting $`(M_{d_{\ell}}^e,V_{d_{\ell}}^e)`$ and $`(M_{d_{\ell}}^{e'},V_{d_{\ell}}^{e'})`$ such that:
@@ -267,7 +275,23 @@ Under (A1), $`|M^e_{d_{\ell}}|=|\mathbb E[D^e_{d_{\ell}}]|\le \mathbb E|D^e_{d_{
 Under (A2), $`\tilde M_{d_{\ell}}^2+\tilde V_{d_{\ell}}\ge c`$. Therefore,
 
 $$
-\begin{aligned}\left|\frac{\partial g}{\partial M}(\tilde M_{d_{\ell}},\tilde V_{d_{\ell}})\right|&=\frac{2|\tilde M_{d_{\ell}}|\tilde V_{d_{\ell}}}{(\tilde M_{d_{\ell}}^2+\tilde V_{d_{\ell}})^2}\le \frac{2B_{D}\cdot B_{D}^2}{c^2}= \frac{2B_{D}^3}{c^2}\\\left|\frac{\partial g}{\partial V}(\tilde M_{d_{\ell}},\tilde V_{d_{\ell}})\right|&=\frac{\tilde M_{d_{\ell}}^2}{(\tilde M_{d_{\ell}}^2+\tilde V_{d_{\ell}})^2}\le \frac{B_{D}^2}{c^2}\end{aligned}
+\begin{aligned}
+\lvert \frac{\partial g}{\partial M}(\tilde M_{d_{\ell}},\tilde V_{d_{\ell}}) \rvert
+&=
+\frac{2\lvert \tilde M_{d_{\ell}} \rvert \tilde V_{d_{\ell}}}
+{(\tilde M_{d_{\ell}}^2+\tilde V_{d_{\ell}})^2}
+\le
+\frac{2B_{D}\cdot B_{D}^2}{c^2}
+=
+\frac{2B_{D}^3}{c^2},
+\\
+\lvert \frac{\partial g}{\partial V}(\tilde M_{d_{\ell}},\tilde V_{d_{\ell}}) \rvert
+&=
+\frac{\tilde M_{d_{\ell}}^2}
+{(\tilde M_{d_{\ell}}^2+\tilde V_{d_{\ell}})^2}
+\le
+\frac{B_{D}^2}{c^2}.
+\end{aligned}
 $$
 
 Hence,
