@@ -275,30 +275,37 @@ Under (A1), $`|M^e_{d_{\ell}}|=|\mathbb E[D^e_{d_{\ell}}]|\le \mathbb E|D^e_{d_{
 Under (A2), $`\tilde M_{d_{\ell}}^2+\tilde V_{d_{\ell}}\ge c`$. Therefore,
 
 $$
-\begin{aligned}
 \lvert \frac{\partial g}{\partial M}(\tilde M_{d_{\ell}},\tilde V_{d_{\ell}}) \rvert
-&=
+=
 \frac{2\lvert \tilde M_{d_{\ell}} \rvert \tilde V_{d_{\ell}}}
 {(\tilde M_{d_{\ell}}^2+\tilde V_{d_{\ell}})^2}
 \le
 \frac{2B_{D}\cdot B_{D}^2}{c^2}
 =
-\frac{2B_{D}^3}{c^2},
-\\
+\frac{2B_{D}^3}{c^2}.
+$$
+
+$$
 \lvert \frac{\partial g}{\partial V}(\tilde M_{d_{\ell}},\tilde V_{d_{\ell}}) \rvert
-&=
+=
 \frac{\tilde M_{d_{\ell}}^2}
 {(\tilde M_{d_{\ell}}^2+\tilde V_{d_{\ell}})^2}
 \le
 \frac{B_{D}^2}{c^2}.
-\end{aligned}
 $$
 
 Hence,
 
 $$
-|R^e_{d_{\ell}}-R^{e'}_{d_{\ell}}|\le\frac{2B_{D}^3}{c^2}|M^e_{d_{\ell}}-M^{e'}_{d_{\ell}}|+\frac{B_{D}^2}{c^2}|V^e_{d_{\ell}}-V^{e'}_{d_{\ell}}|
+\lvert R^e_{d_{\ell}}-R^{e'}_{d_{\ell}} \rvert
+\le
+\frac{2B_{D}^3}{c^2}
+\lvert M^e_{d_{\ell}}-M^{e'}_{d_{\ell}} \rvert
++
+\frac{B_{D}^2}{c^2}
+\lvert V^e_{d_{\ell}}-V^{e'}_{d_{\ell}} \rvert.
 $$
+
 
 Then, let $`\mathbb{P}^e=\mathbb{P}_{Q,T}^e\otimes\mathbb{P}_{Q,H}^e`$ and $`\mathbb{P}^{e'}=\mathbb{P}_{Q,T}^{e'}\otimes\mathbb{P}_{Q,H}^{e'}`$. By Assumption 1, we view $`D^e_{d_{\ell}}`$ as $`f(\mathbf Q,\mathbf T,\mathbf Q',\mathbf H)`$ with $`\|f\|_{\infty}\le B_{D}`$. According to the Auxiliary Lemma,
 
