@@ -272,40 +272,23 @@ $$
 
 Under (A1), $`|M^e_{d_{\ell}}|=|\mathbb E[D^e_{d_{\ell}}]|\le \mathbb E|D^e_{d_{\ell}}|\le B_{D}`$, and $`0\le V^e_{d_{\ell}}\le \mathbb E[(D^e_{d_{\ell}})^2]\le B_{D}^2`$, hence $`|\tilde M_{d_{\ell}}|\le B_{D}`$ and $`0\le \tilde V_{d_{\ell}}\le B_{D}^2`$.
 
-Under (A2), $`\tilde M_{d_{\ell}}^2+\tilde V_{d_{\ell}}\ge c`$. Therefore,
-
-$$
-\lvert \frac{\partial g}{\partial M}(\tilde M_{d_{\ell}},\tilde V_{d_{\ell}}) \rvert
-=
-\frac{2\lvert \tilde M_{d_{\ell}} \rvert \tilde V_{d_{\ell}}}
-{(\tilde M_{d_{\ell}}^2+\tilde V_{d_{\ell}})^2}
-\le
-\frac{2B_{D}\cdot B_{D}^2}{c^2}
-=
-\frac{2B_{D}^3}{c^2}.
-$$
-
-$$
-\lvert \frac{\partial g}{\partial V}(\tilde M_{d_{\ell}},\tilde V_{d_{\ell}}) \rvert
-=
-\frac{\tilde M_{d_{\ell}}^2}
-{(\tilde M_{d_{\ell}}^2+\tilde V_{d_{\ell}})^2}
-\le
-\frac{B_{D}^2}{c^2}.
-$$
+Under (A2), $`\tilde M_{d_{\ell}}^2+\tilde V_{d_{\ell}}\ge c`$. Therefore, the two partial derivatives are uniformly bounded as follows:
+$`\big|\frac{\partial g}{\partial M}(\tilde M_{d_{\ell}},\tilde V_{d_{\ell}})\big|
+\le \frac{2B_{D}^3}{c^2}`$ and
+$`\big|\frac{\partial g}{\partial V}(\tilde M_{d_{\ell}},\tilde V_{d_{\ell}})\big|
+\le \frac{B_{D}^2}{c^2}`$.
 
 Hence,
 
 $$
-\lvert R^e_{d_{\ell}}-R^{e'}_{d_{\ell}} \rvert
+\big|R^e_{d_{\ell}}-R^{e'}_{d_{\ell}}\big|
 \le
 \frac{2B_{D}^3}{c^2}
-\lvert M^e_{d_{\ell}}-M^{e'}_{d_{\ell}} \rvert
+\big|M^e_{d_{\ell}}-M^{e'}_{d_{\ell}}\big|
 +
 \frac{B_{D}^2}{c^2}
-\lvert V^e_{d_{\ell}}-V^{e'}_{d_{\ell}} \rvert.
+\big|V^e_{d_{\ell}}-V^{e'}_{d_{\ell}}\big|.
 $$
-
 
 Then, let $`\mathbb{P}^e=\mathbb{P}_{Q,T}^e\otimes\mathbb{P}_{Q,H}^e`$ and $`\mathbb{P}^{e'}=\mathbb{P}_{Q,T}^{e'}\otimes\mathbb{P}_{Q,H}^{e'}`$. By Assumption 1, we view $`D^e_{d_{\ell}}`$ as $`f(\mathbf Q,\mathbf T,\mathbf Q',\mathbf H)`$ with $`\|f\|_{\infty}\le B_{D}`$. According to the Auxiliary Lemma,
 
