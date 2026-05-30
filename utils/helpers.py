@@ -30,7 +30,6 @@ def build_layerwise_matrix(embeds: np.ndarray, rep: str = "hidden") -> np.ndarra
     else:
         return embeds[:, 1:, :] - embeds[:, :-1, :]
 
-# ----------------- 解析辅助函数 -----------------
 def _parse_int_list(s: str):
     if s is None: return []
     return [int(chunk.strip()) for chunk in s.replace(";", ",").replace(" ", ",").split(",") if chunk.strip()]
