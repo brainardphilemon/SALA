@@ -1,3 +1,16 @@
+# Adapted from the official codebase of Invariant-feature Subspace Recovery (ISR):
+# https://github.com/uiuctml/ISR
+#
+# Original paper:
+#   Haoxiang Wang, Haozhe Si, Bo Li, and Han Zhao.
+#   "Provable Domain Generalization via Invariant-Feature Subspace Recovery."
+#   International Conference on Machine Learning (ICML), 2022.
+#
+# The original ISR implementation is licensed under the MIT License.
+# This file modifies and integrates the ISR procedure into our
+# multi-domain hallucination detection benchmark and evaluation pipeline.
+
+
 import torch
 import numpy as np
 import random
