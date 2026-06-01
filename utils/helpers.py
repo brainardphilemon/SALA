@@ -8,7 +8,6 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import roc_auc_score
 
-# 导入你刚刚拆分好的分类器
 from models.classifiers import StrongMLP
 from models.projections import train_layerwise_invariant_projection, compute_isr_init_W
 
@@ -50,7 +49,7 @@ def _mean_std_from_folds(folds):
     if len(vals) == 0: return float("nan"), float("nan")
     return float(np.mean(vals)), float(np.std(vals))
 
-# ----------------- 训练与评估逻辑 -----------------
+
 @torch.no_grad()
 def eval_auc_loader(model, loader, device):
     model.eval()
