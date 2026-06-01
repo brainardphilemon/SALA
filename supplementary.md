@@ -1,7 +1,3 @@
----
-title: supplementary.md
-
----
 
 ## Hyperparameter Sensitivity
 

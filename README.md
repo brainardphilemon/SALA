@@ -1,7 +1,3 @@
----
-title: README.md
-
----
 
 # Training a Generalist Hallucination Detector across Multiple Domains via Adaptive Layer Aggregation
 
@@ -136,7 +132,7 @@ If you find this repository useful, please cite our paper:
 ```bibtex
 @inproceedings{li2026sala,
   title     = {Training a Generalist Hallucination Detector across Multiple Domains via Adaptive Layer Aggregation},
-  author    = {Li, Xinyi and Deng, Yongxin and others},
+  author    = {Li, Xinyi and Fang, Zhen and Luo, Yadan and others},
   booktitle = {Proceedings of the 32nd ACM SIGKDD Conference on Knowledge Discovery and Data Mining V.2},
   year      = {2026},
   publisher = {Association for Computing Machinery},
