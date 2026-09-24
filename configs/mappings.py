@@ -42,6 +42,7 @@ HF_NAMES = {
     "Llama3-8B-Instruct": "meta-llama/Meta-Llama-3-8B-Instruct",
     "llama3.1-8B": "meta-llama/Meta-Llama-3.1-8B",
     "qwen2.5-7B": "Qwen/Qwen2.5-7B",
+    "Qwen2.5-7B-Instruct": "Qwen/Qwen2.5-7B-Instruct",
     "qwen2.5-14B": "Qwen/Qwen2.5-14B",
     "Llama3.1-8B-Instruct": "meta-llama/Meta-Llama-3.1-8B-Instruct",
     "Llama3.2-3B-Instruct": "meta-llama/Meta-Llama-3.2-3B-Instruct"
