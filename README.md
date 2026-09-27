@@ -21,10 +21,14 @@ logs a SALA correctness probability plus the input/output/reference text and lab
 - For G14 with the complete TriviaQA validation question set as target, see
   [the G14 guide](docs/KAGGLE_QWEN_G14_TRIVIAQA_BLEURT.md) or import
   [`qwen25_7b_sala_g14_triviaqa_bleurt.ipynb`](kaggle/qwen25_7b_sala_g14_triviaqa_bleurt.ipynb).
+- For G15 with the complete NQ-Open validation split as target, see
+  [the G15 guide](docs/KAGGLE_QWEN_G15_NQ_BLEURT.md) or import
+  [`qwen25_7b_sala_g15_nq_bleurt.ipynb`](kaggle/qwen25_7b_sala_g15_nq_bleurt.ipynb).
 
 The mappings remain faithful to this repository: `G3` is TruthfulQA → TriviaQA and
 `G5` is SciQ → NQ-Open. `G14` trains on TruthfulQA + NQ-Open + SciQ and evaluates
-TriviaQA as the unseen target.
+TriviaQA as the unseen target. `G15` trains on TruthfulQA + SciQ + TriviaQA and
+evaluates NQ-Open as the unseen target.
 
 This repository implements **SALA** (**S**tability-**A**ware **L**ayer **A**ggregation), a method for **Multi-Domain Generalizable Hallucination Detection (MGHD)** in large language models. SALA is designed to train hallucination detectors on multiple labeled source domains and generalize to unseen target domains without requiring target-domain supervision.
 

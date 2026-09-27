@@ -1,9 +1,10 @@
-"""Kaggle pipeline for SALA G3/G5/G14 with Qwen2.5-7B and BLEURT-20 labels.
+"""Kaggle pipeline for SALA G3/G5/G14/G15 with Qwen2.5-7B and BLEURT-20 labels.
 
 Official mappings are preserved:
   G3: TruthfulQA -> TriviaQA
   G5: SciQ -> NQ-Open
   G14: TruthfulQA + NQ-Open + SciQ -> TriviaQA
+  G15: TruthfulQA + SciQ + TriviaQA -> NQ-Open
 
 BLEURT-20 is the only reference-based correctness evaluator. The pipeline extracts
 the final answer-token representation at every Qwen layer, matching the feature
@@ -37,6 +38,7 @@ SETTING_MAP = {
     "G3": {"source": "tqa", "target": "triviaqa"},
     "G5": {"source": "sciq", "target": "nq_open"},
     "G14": {"source": ["tqa", "nq_open", "sciq"], "target": "triviaqa"},
+    "G15": {"source": ["tqa", "sciq", "triviaqa"], "target": "nq_open"},
 }
 
 DATASET_SPECS = {

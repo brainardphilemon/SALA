@@ -46,6 +46,17 @@ class SalaKaggleTests(unittest.TestCase):
         self.assertFalse(set(validation) & set(test))
         self.assertEqual(set(np.unique(labels[train])), {0, 1})
 
+    def test_official_g15_mapping_uses_nq_open_as_target(self):
+        self.assertEqual(
+            SETTING_MAP["G15"],
+            {"source": ["tqa", "sciq", "triviaqa"], "target": "nq_open"},
+        )
+        self.assertEqual(source_domains("G15"), ["tqa", "sciq", "triviaqa"])
+        self.assertEqual(
+            required_domains(["G15"]),
+            ["tqa", "sciq", "triviaqa", "nq_open"],
+        )
+
     def test_probability_threshold_uses_one_as_correct(self):
         threshold, details = calibrate_threshold(
             [0.1, 0.2, 0.8, 0.9],
