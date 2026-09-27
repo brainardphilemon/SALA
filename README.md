@@ -10,16 +10,21 @@ Official PyTorch implementation for the KDD 2026 paper:
 
 **Training a Generalist Hallucination Detector across Multiple Domains via Adaptive Layer Aggregation**
 
-## Kaggle: Qwen2.5-7B, BLEURT-20, G3 and G5
+## Kaggle: Qwen2.5-7B with BLEURT-20
 
 A self-contained Kaggle workflow now extracts Qwen2.5-7B-Instruct layer features,
-labels answers using only BLEURT-20, trains the official `G3` and `G5` mappings, and
+labels answers using only BLEURT-20, trains the official SALA mappings, and
 logs a SALA correctness probability plus the input/output/reference text and labels.
-See [the Kaggle guide](docs/KAGGLE_QWEN_G3_G5_BLEURT.md) or import
-[`kaggle/qwen25_7b_sala_g3_g5_bleurt.ipynb`](kaggle/qwen25_7b_sala_g3_g5_bleurt.ipynb).
+
+- For G3/G5, see [the G3/G5 guide](docs/KAGGLE_QWEN_G3_G5_BLEURT.md) or import
+  [`qwen25_7b_sala_g3_g5_bleurt.ipynb`](kaggle/qwen25_7b_sala_g3_g5_bleurt.ipynb).
+- For G14 with the complete TriviaQA validation question set as target, see
+  [the G14 guide](docs/KAGGLE_QWEN_G14_TRIVIAQA_BLEURT.md) or import
+  [`qwen25_7b_sala_g14_triviaqa_bleurt.ipynb`](kaggle/qwen25_7b_sala_g14_triviaqa_bleurt.ipynb).
 
 The mappings remain faithful to this repository: `G3` is TruthfulQA → TriviaQA and
-`G5` is SciQ → NQ-Open. Thus, G5 is the requested NQ-Open target evaluation.
+`G5` is SciQ → NQ-Open. `G14` trains on TruthfulQA + NQ-Open + SciQ and evaluates
+TriviaQA as the unseen target.
 
 This repository implements **SALA** (**S**tability-**A**ware **L**ayer **A**ggregation), a method for **Multi-Domain Generalizable Hallucination Detection (MGHD)** in large language models. SALA is designed to train hallucination detectors on multiple labeled source domains and generalize to unseen target domains without requiring target-domain supervision.
 

@@ -5,11 +5,16 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
+import numpy as np
+
 from sala_kaggle import (
     FINAL_COLUMNS,
     SETTING_MAP,
     calibrate_threshold,
     csv_dump_atomic,
+    required_domains,
+    source_domains,
+    source_split_indices,
     stack_last_token_features,
 )
 
@@ -18,6 +23,28 @@ class SalaKaggleTests(unittest.TestCase):
     def test_official_g3_g5_mappings_are_preserved(self):
         self.assertEqual(SETTING_MAP["G3"], {"source": "tqa", "target": "triviaqa"})
         self.assertEqual(SETTING_MAP["G5"], {"source": "sciq", "target": "nq_open"})
+
+    def test_official_g14_mapping_uses_triviaqa_as_target(self):
+        self.assertEqual(
+            SETTING_MAP["G14"],
+            {"source": ["tqa", "nq_open", "sciq"], "target": "triviaqa"},
+        )
+        self.assertEqual(source_domains("G14"), ["tqa", "nq_open", "sciq"])
+        self.assertEqual(
+            required_domains(["G14"]),
+            ["tqa", "nq_open", "sciq", "triviaqa"],
+        )
+
+    def test_g14_splits_each_source_without_overlap(self):
+        labels = np.asarray([0, 1] * 50, dtype=np.int64)
+        train, validation, test = source_split_indices(labels, "G14", "tqa")
+        self.assertEqual(len(train), 67)
+        self.assertEqual(len(validation), 8)
+        self.assertEqual(len(test), 25)
+        self.assertFalse(set(train) & set(validation))
+        self.assertFalse(set(train) & set(test))
+        self.assertFalse(set(validation) & set(test))
+        self.assertEqual(set(np.unique(labels[train])), {0, 1})
 
     def test_probability_threshold_uses_one_as_correct(self):
         threshold, details = calibrate_threshold(

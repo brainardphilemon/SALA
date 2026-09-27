@@ -1,13 +1,14 @@
-"""Kaggle pipeline for SALA G3/G5 with Qwen2.5-7B and BLEURT-20 labels.
+"""Kaggle pipeline for SALA G3/G5/G14 with Qwen2.5-7B and BLEURT-20 labels.
 
 Official mappings are preserved:
   G3: TruthfulQA -> TriviaQA
   G5: SciQ -> NQ-Open
+  G14: TruthfulQA + NQ-Open + SciQ -> TriviaQA
 
 BLEURT-20 is the only reference-based correctness evaluator. The pipeline extracts
 the final answer-token representation at every Qwen layer, matching the feature
-format consumed by the original SALA implementation, trains one source-domain SALA
-detector per setting, and evaluates the full target domain without target labels.
+format consumed by the original SALA implementation, trains one SALA detector per
+setting, and evaluates the full target domain without target labels.
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ DEFAULT_BLEURT_REVISION = "e22b9eb071dcb939da9fff08b20a7e746c72a830"
 SETTING_MAP = {
     "G3": {"source": "tqa", "target": "triviaqa"},
     "G5": {"source": "sciq", "target": "nq_open"},
+    "G14": {"source": ["tqa", "nq_open", "sciq"], "target": "triviaqa"},
 }
 
 DATASET_SPECS = {
@@ -113,6 +115,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bleurt-batch-size", type=int, default=16)
     parser.add_argument("--bleurt-threshold", type=float, default=0.5)
     parser.add_argument("--proj-dim", type=int, default=32)
+    lodo = parser.add_mutually_exclusive_group()
+    lodo.add_argument(
+        "--use-lodo-dim",
+        action="store_true",
+        help="Select each layer's projection dimension by leave-one-source-domain-out validation",
+    )
+    lodo.add_argument("--no-lodo-dim", dest="use_lodo_dim", action="store_false")
+    parser.set_defaults(use_lodo_dim=False)
+    parser.add_argument("--proj-dim-candidates", default="8,16,32,64,128,256,512")
+    parser.add_argument("--epochs-proj-selection", type=int, default=40)
+    parser.add_argument("--epochs-probe-selection", type=int, default=40)
     parser.add_argument("--epochs-proj", type=int, default=40)
     parser.add_argument("--epochs-erm", type=int, default=40)
     parser.add_argument("--lam-inv", type=float, default=1.0)
@@ -132,8 +145,18 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Batch/chunk sizes must be positive")
     if args.proj_dim < 1 or args.epochs_proj < 1 or args.epochs_erm < 1:
         raise ValueError("Projection dimension and epoch counts must be positive")
+    if args.epochs_proj_selection < 1 or args.epochs_probe_selection < 1:
+        raise ValueError("LODO projection/probe epoch counts must be positive")
+    candidates = [int(value.strip()) for value in args.proj_dim_candidates.split(",") if value.strip()]
+    if args.use_lodo_dim and not candidates:
+        raise ValueError("--use-lodo-dim requires at least one --proj-dim-candidates value")
+    if any(value < 1 for value in candidates):
+        raise ValueError("Projection dimension candidates must be positive")
     if not args.settings:
         raise ValueError("Select at least one SALA setting")
+    for setting in args.settings:
+        if args.use_lodo_dim and len(source_domains(setting)) < 2:
+            raise ValueError(f"--use-lodo-dim requires multiple source domains; {setting} has one")
 
 
 def json_dump_atomic(path: Path, value: Any) -> None:
@@ -265,11 +288,20 @@ def load_domain_records(domain: str, args: argparse.Namespace) -> list[dict[str,
 def required_domains(settings: Sequence[str]) -> list[str]:
     domains: list[str] = []
     for setting in settings:
-        for role in ("source", "target"):
-            domain = SETTING_MAP[setting][role]
+        mapping = SETTING_MAP[setting]
+        setting_domains = [*source_domains(setting), str(mapping["target"])]
+        for domain in setting_domains:
             if domain not in domains:
                 domains.append(domain)
     return domains
+
+
+def source_domains(setting: str) -> list[str]:
+    """Return the ordered source environments for a SALA setting."""
+    source = SETTING_MAP[setting]["source"]
+    if isinstance(source, str):
+        return [source]
+    return [str(domain) for domain in source]
 
 
 def chat_prompt(tokenizer, question: str, system_prompt: str) -> str:
@@ -720,7 +752,8 @@ def project_target_layer(
 def training_manifest(setting: str, args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
     mapping = SETTING_MAP[setting]
     manifests = {}
-    for domain in mapping.values():
+    domains = [*source_domains(setting), str(mapping["target"])]
+    for domain in domains:
         score_path = output_dir / "bleurt" / domain / "scores.jsonl"
         manifests[domain] = {
             "generation": json.loads((output_dir / "generation" / domain / "manifest.json").read_text()),
@@ -734,13 +767,17 @@ def training_manifest(setting: str, args: argparse.Namespace, output_dir: Path) 
         "inputs_sha256": sha256_json(manifests),
         "bleurt_threshold": args.bleurt_threshold,
         "proj_dim": args.proj_dim,
+        "use_lodo_dim": args.use_lodo_dim,
+        "proj_dim_candidates": args.proj_dim_candidates,
+        "epochs_proj_selection": args.epochs_proj_selection,
+        "epochs_probe_selection": args.epochs_probe_selection,
         "epochs_proj": args.epochs_proj,
         "epochs_erm": args.epochs_erm,
         "lam_inv": args.lam_inv,
         "lam_sep": args.lam_sep,
         "lam_reg": args.lam_reg,
         "seed": args.seed,
-        "source_split": "67.5% train, 7.5% validation, 25% source test; stratified",
+        "source_split": "per-domain 67.5% train, 7.5% validation, 25% source test; stratified",
         "target_policy": "full target domain; no target labels used for fitting or threshold calibration",
     }
 
@@ -758,12 +795,34 @@ def load_labels(domain: str, args: argparse.Namespace, output_dir: Path) -> tupl
     return rows, labels
 
 
-def train_setting(setting: str, args: argparse.Namespace, output_dir: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    import torch
+def source_split_indices(labels: np.ndarray, setting: str, domain: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Match SALA's independent stratified train/validation/test split per source domain."""
     from sklearn.model_selection import StratifiedShuffleSplit
 
+    if len(np.unique(labels)) < 2:
+        raise ValueError(
+            f"{setting} source {domain} contains only one BLEURT class; "
+            "increase --samples-per-domain or use the full dataset"
+        )
+    indices = np.arange(len(labels))
+    try:
+        outer = StratifiedShuffleSplit(n_splits=1, test_size=0.25, random_state=42)
+        trainval_idx, test_idx = next(outer.split(indices, labels))
+        inner = StratifiedShuffleSplit(n_splits=1, test_size=0.10, random_state=43)
+        train_pos, val_pos = next(inner.split(trainval_idx, labels[trainval_idx]))
+    except ValueError as exc:
+        raise ValueError(
+            f"{setting} source {domain} is too small for the stratified SALA split; "
+            "increase --samples-per-domain"
+        ) from exc
+    return trainval_idx[train_pos], trainval_idx[val_pos], test_idx
+
+
+def train_setting(setting: str, args: argparse.Namespace, output_dir: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    import torch
+
     from models.projections import compute_isr_init_W, train_layerwise_invariant_projection
-    from utils.helpers import seed_everything, train_erm
+    from utils.helpers import seed_everything, select_best_proj_dim_lodo, train_erm
 
     setting_dir = output_dir / "results" / setting
     current_manifest = training_manifest(setting, args, output_dir)
@@ -774,58 +833,122 @@ def train_setting(setting: str, args: argparse.Namespace, output_dir: Path) -> t
         return read_jsonl(result_path), json.loads(summary_path.read_text(encoding="utf-8"))
 
     mapping = SETTING_MAP[setting]
-    source_domain, target_domain = mapping["source"], mapping["target"]
-    source_rows, source_labels = load_labels(source_domain, args, output_dir)
+    sources = source_domains(setting)
+    target_domain = str(mapping["target"])
     target_rows, target_labels = load_labels(target_domain, args, output_dir)
-    if len(np.unique(source_labels)) < 2:
-        raise ValueError(f"{setting} source labels contain only one class; increase --samples-per-domain")
-    source_features = np.load(
-        output_dir / "generation" / source_domain / "features.npy", mmap_mode="r"
-    )
     target_features = np.load(
         output_dir / "generation" / target_domain / "features.npy", mmap_mode="r"
     )
-    if source_features.shape[1:] != target_features.shape[1:]:
-        raise ValueError(f"Feature shapes differ for {setting}")
-    num_layers, hidden_size = source_features.shape[1:]
+
+    source_bundles: list[dict[str, Any]] = []
+    for domain_id, domain in enumerate(sources):
+        rows, labels = load_labels(domain, args, output_dir)
+        features = np.load(output_dir / "generation" / domain / "features.npy", mmap_mode="r")
+        if features.shape[1:] != target_features.shape[1:]:
+            raise ValueError(f"Feature shapes differ between {domain} and {target_domain}")
+        train_idx, val_idx, test_idx = source_split_indices(labels, setting, domain)
+        source_bundles.append({
+            "domain": domain,
+            "domain_id": domain_id,
+            "rows": rows,
+            "labels": labels,
+            "features": features,
+            "train_idx": train_idx,
+            "val_idx": val_idx,
+            "test_idx": test_idx,
+        })
+
+    num_layers, hidden_size = target_features.shape[1:]
     if args.proj_dim > hidden_size:
         raise ValueError(f"--proj-dim {args.proj_dim} exceeds hidden size {hidden_size}")
 
-    indices = np.arange(len(source_labels))
-    outer = StratifiedShuffleSplit(n_splits=1, test_size=0.25, random_state=42)
-    trainval_idx, source_test_idx = next(outer.split(indices, source_labels))
-    inner = StratifiedShuffleSplit(n_splits=1, test_size=0.10, random_state=43)
-    train_pos, val_pos = next(inner.split(trainval_idx, source_labels[trainval_idx]))
-    train_idx, val_idx = trainval_idx[train_pos], trainval_idx[val_pos]
-    y_train, y_val, y_source_test = source_labels[train_idx], source_labels[val_idx], source_labels[source_test_idx]
-    domain_ids = np.zeros(len(train_idx), dtype=np.int64)
-    if min(np.bincount(y_train, minlength=2)) < 2:
-        raise ValueError(f"{setting} source training split needs at least two examples per BLEURT class")
+    y_train = np.concatenate([bundle["labels"][bundle["train_idx"]] for bundle in source_bundles])
+    y_val = np.concatenate([bundle["labels"][bundle["val_idx"]] for bundle in source_bundles])
+    y_source_test = np.concatenate([bundle["labels"][bundle["test_idx"]] for bundle in source_bundles])
+    domain_ids = np.concatenate([
+        np.full(len(bundle["train_idx"]), bundle["domain_id"], dtype=np.int64)
+        for bundle in source_bundles
+    ])
+    val_domain_ids = np.concatenate([
+        np.full(len(bundle["val_idx"]), bundle["domain_id"], dtype=np.int64)
+        for bundle in source_bundles
+    ])
+    for bundle in source_bundles:
+        train_labels = bundle["labels"][bundle["train_idx"]]
+        if min(np.bincount(train_labels, minlength=2)) < 2:
+            raise ValueError(
+                f"{setting} source {bundle['domain']} needs at least two training examples per BLEURT class"
+            )
 
     device = torch.device(args.train_device if torch.cuda.is_available() else "cpu")
     seed_everything(args.seed)
-    concat_dim = num_layers * args.proj_dim
-    z_train_all = np.empty((len(train_idx), concat_dim), dtype=np.float32)
-    z_val_all = np.empty((len(val_idx), concat_dim), dtype=np.float32)
-    z_source_test_all = np.empty((len(source_test_idx), concat_dim), dtype=np.float32)
-    z_target_all = np.empty((len(target_rows), concat_dim), dtype=np.float32)
+    z_train_layers: list[np.ndarray] = []
+    z_val_layers: list[np.ndarray] = []
+    z_source_test_layers: list[np.ndarray] = []
+    z_target_layers: list[np.ndarray] = []
+    selected_proj_dims: list[int] = []
+    lodo_selection: list[dict[str, Any]] = []
+    candidate_dims = [
+        int(value.strip())
+        for value in args.proj_dim_candidates.split(",")
+        if value.strip() and int(value.strip()) <= hidden_size
+    ]
+    if args.use_lodo_dim and not candidate_dims:
+        raise ValueError("No --proj-dim-candidates fit the model hidden size")
+
     for layer in range(num_layers):
-        start_col = layer * args.proj_dim
-        stop_col = start_col + args.proj_dim
-        x_train = np.asarray(source_features[train_idx, layer, :], dtype=np.float32)
-        x_val = np.asarray(source_features[val_idx, layer, :], dtype=np.float32)
-        x_source_test = np.asarray(source_features[source_test_idx, layer, :], dtype=np.float32)
+        x_train = np.concatenate([
+            np.asarray(bundle["features"][bundle["train_idx"], layer, :], dtype=np.float32)
+            for bundle in source_bundles
+        ])
+        x_val = np.concatenate([
+            np.asarray(bundle["features"][bundle["val_idx"], layer, :], dtype=np.float32)
+            for bundle in source_bundles
+        ])
+        x_source_test = np.concatenate([
+            np.asarray(bundle["features"][bundle["test_idx"], layer, :], dtype=np.float32)
+            for bundle in source_bundles
+        ])
         mean = x_train.mean(axis=0, keepdims=True)
         std = x_train.std(axis=0, keepdims=True) + 1e-8
         x_train = (x_train - mean) / std
         x_val = (x_val - mean) / std
         x_source_test = (x_source_test - mean) / std
+
+        projection_dim = args.proj_dim
+        if args.use_lodo_dim:
+            projection_dim, lodo_score, _ = select_best_proj_dim_lodo(
+                x_train,
+                y_train,
+                domain_ids,
+                x_val,
+                y_val,
+                val_domain_ids,
+                proj_dim_candidates=candidate_dims,
+                layer=layer,
+                args=args,
+                device=device,
+                lam_inv=args.lam_inv,
+                lam_sep=args.lam_sep,
+                lam_reg=args.lam_reg,
+                epochs_proj=args.epochs_proj_selection,
+                epochs_probe=args.epochs_probe_selection,
+            )
+            if projection_dim is None:
+                raise RuntimeError(f"LODO projection selection failed for {setting} layer {layer}")
+            lodo_selection.append({
+                "layer": layer,
+                "projection_dim": int(projection_dim),
+                "selection_score": float(lodo_score) if math.isfinite(float(lodo_score)) else None,
+            })
+        selected_proj_dims.append(int(projection_dim))
+
         seed_everything(args.seed + 1000 + (layer + 1) * 10000)
         init_w = compute_isr_init_W(
             x_train,
             y_train,
             domain_ids,
-            proj_dim=args.proj_dim,
+            proj_dim=projection_dim,
             device=device,
         )
         projection = train_layerwise_invariant_projection(
@@ -833,7 +956,7 @@ def train_setting(setting: str, args: argparse.Namespace, output_dir: Path) -> t
             y_train,
             domain_ids,
             init_W=init_w,
-            proj_dim=args.proj_dim,
+            proj_dim=projection_dim,
             n_epochs=args.epochs_proj,
             lr=1e-3,
             lam_inv=args.lam_inv,
@@ -845,10 +968,10 @@ def train_setting(setting: str, args: argparse.Namespace, output_dir: Path) -> t
         z_train = x_train @ projection
         z_mean = z_train.mean(axis=0, keepdims=True)
         z_std = z_train.std(axis=0, keepdims=True) + 1e-6
-        z_train_all[:, start_col:stop_col] = (z_train - z_mean) / z_std
-        z_val_all[:, start_col:stop_col] = (x_val @ projection - z_mean) / z_std
-        z_source_test_all[:, start_col:stop_col] = (x_source_test @ projection - z_mean) / z_std
-        z_target_all[:, start_col:stop_col] = project_target_layer(
+        z_train_layers.append((z_train - z_mean) / z_std)
+        z_val_layers.append((x_val @ projection - z_mean) / z_std)
+        z_source_test_layers.append((x_source_test @ projection - z_mean) / z_std)
+        z_target_layers.append(project_target_layer(
             target_features,
             layer,
             mean,
@@ -857,8 +980,17 @@ def train_setting(setting: str, args: argparse.Namespace, output_dir: Path) -> t
             z_mean,
             z_std,
             args.projection_chunk_size,
+        ))
+        print(
+            f"{setting} projected layer {layer + 1}/{num_layers} dim={projection_dim}",
+            flush=True,
         )
-        print(f"{setting} projected layer {layer + 1}/{num_layers}", flush=True)
+
+    z_train_all = np.concatenate(z_train_layers, axis=1)
+    z_val_all = np.concatenate(z_val_layers, axis=1)
+    z_source_test_all = np.concatenate(z_source_test_layers, axis=1)
+    z_target_all = np.concatenate(z_target_layers, axis=1)
+    concat_dim = int(z_train_all.shape[1])
 
     seed_everything(args.seed)
     model, best_source_val_auc = train_erm(
@@ -890,7 +1022,8 @@ def train_setting(setting: str, args: argparse.Namespace, output_dir: Path) -> t
         results.append({
             **row,
             "setting": setting,
-            "source_domain": source_domain,
+            "source_domain": "+".join(sources),
+            "source_domains": sources,
             "target_domain": target_domain,
             "ground_truth_text": judged["ground_truth_text"],
             "ground_truth_label": int(label),
@@ -903,7 +1036,8 @@ def train_setting(setting: str, args: argparse.Namespace, output_dir: Path) -> t
     summary = {
         "schema_version": 1,
         "setting": setting,
-        "source_domain": source_domain,
+        "source_domain": "+".join(sources),
+        "source_domains": sources,
         "target_domain": target_domain,
         "model": args.model,
         "bleurt_model": args.bleurt_model,
@@ -921,6 +1055,18 @@ def train_setting(setting: str, args: argparse.Namespace, output_dir: Path) -> t
             target_labels.tolist(), target_predictions.tolist(), target_scores.tolist()
         ),
         "target_supervision_used": False,
+        "source_counts": {
+            bundle["domain"]: {
+                "total": len(bundle["labels"]),
+                "train": len(bundle["train_idx"]),
+                "validation": len(bundle["val_idx"]),
+                "test": len(bundle["test_idx"]),
+            }
+            for bundle in source_bundles
+        },
+        "projection_dimension_policy": "lodo" if args.use_lodo_dim else "fixed",
+        "selected_projection_dimensions": selected_proj_dims,
+        "lodo_selection": lodo_selection,
         "num_layers_including_embedding_output": num_layers,
         "hidden_size": hidden_size,
         "projected_concat_dimension": concat_dim,
@@ -928,7 +1074,9 @@ def train_setting(setting: str, args: argparse.Namespace, output_dir: Path) -> t
     jsonl_dump_atomic(result_path, results)
     csv_dump_atomic(setting_dir / "results.csv", results)
     json_dump_atomic(summary_path, summary)
-    del model, source_features, target_features
+    del model, target_features
+    for bundle in source_bundles:
+        del bundle["features"]
     release_gpu(torch)
     return results, summary
 
