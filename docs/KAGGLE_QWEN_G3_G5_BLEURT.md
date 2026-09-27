@@ -22,18 +22,27 @@ workflow, with HIDE's detector score replaced by SALA's classifier probability:
 - `ground_truth_text` (the highest-scoring reference alias)
 - `ground_truth_label`
 - `bleurt_score`
+- `raw_logit`
 - `sala_probability`
 - `predicted_label`
+- `classifier_loss`, `logit_adjustment_tau`, `training_logit_adjustment`
+- `source_train_prior_0`, `source_train_prior_1`
 - `split` (`target_evaluation` for every reported row)
 - `sala_threshold`
 - `ground_truth_answers`
 - setting and source/target domain identifiers
 
-`sala_probability` is `sigmoid(logit)`: the probability assigned by the source-trained
-SALA classifier to `1 = BLEURT-correct/non-hallucinated`. `predicted_label` is obtained
-by applying a threshold calibrated only on source validation examples. Target-domain
+The final MLP uses the training-time logit-adjusted loss from Menon et al., Equation
+10. The adjustment is calculated from source-training labels and added only inside the
+loss. `raw_logit` is the unadjusted inference logit,
+`sala_probability = sigmoid(raw_logit)`, and
+`predicted_label = int(raw_logit >= 0)` (probability threshold `0.5`). Target-domain
 labels are never used for feature scaling, projection learning, classifier training,
-early stopping, or threshold calibration.
+early stopping, class-prior estimation, or prediction-threshold selection.
+
+This change affects only the final MLP loss. Qwen feature extraction and SALA's
+layer-wise projections are unchanged. See Menon et al.,
+[Long-Tail Learning via Logit Adjustment](https://arxiv.org/abs/2007.07314).
 
 ## Correctness labels
 
@@ -75,7 +84,11 @@ on a 16 GB Kaggle GPU. Use `--no-4bit` on a larger GPU for FP16/BF16 weights.
 ```
 
 ```python
-!python sala_kaggle.py --output-dir /kaggle/working/sala_qwen25_g3_g5_bleurt --settings G3 G5
+!python sala_kaggle.py \
+    --output-dir /kaggle/working/sala_qwen25_g3_g5_bleurt \
+    --settings G3 G5 \
+    --classifier-loss logit_adjusted \
+    --logit-adjustment-tau 1.0
 ```
 
 The full run generates four datasets and can take a long time. Run a complete small
@@ -87,7 +100,9 @@ pipeline first with a new output directory:
     --settings G3 G5 \
     --samples-per-domain 100 \
     --epochs-proj 5 \
-    --epochs-erm 5
+    --epochs-erm 5 \
+    --classifier-loss logit_adjusted \
+    --logit-adjustment-tau 1.0
 ```
 
 Generation features and BLEURT rows are flushed after every completed example, so an
@@ -130,6 +145,8 @@ OUTPUT_DIR/
 --proj-dim 32                fixed layer-wise projected dimension
 --epochs-proj 40             SALA projection epochs per layer
 --epochs-erm 40              final SALA classifier epochs
+--classifier-loss logit_adjusted  Menon et al. Eq. 10 loss for the final MLP
+--logit-adjustment-tau 1.0   source-prior adjustment strength
 ```
 
 The original `--use_lodo_dim` selector is intentionally not used for G3/G5 because

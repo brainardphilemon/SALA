@@ -21,9 +21,14 @@ context-free question more than once; it does not take a smaller random sample.
 5. Creates `ground_truth_label = int(bleurt_score >= 0.5)`.
 6. Splits each source domain independently into 67.5% train, 7.5% validation and 25%
    source test partitions, preserving the official multi-environment G14 structure.
-7. Trains SALA across the three source-domain IDs and evaluates every TriviaQA target
-   example without using TriviaQA labels for training, scaling, projection learning,
-   early stopping, or threshold calibration.
+7. Trains SALA across the three source-domain IDs. The final MLP uses the training-time
+   logit-adjusted loss from Menon et al. (Equation 10), with `tau = 1.0` and class
+   priors calculated only from the pooled source-training labels.
+8. Evaluates every TriviaQA target example without using TriviaQA labels for training,
+   scaling, projection learning, early stopping, or prediction-threshold selection.
+
+Logit adjustment changes only the final MLP training loss. Qwen feature extraction,
+the layer-wise SALA projections, and optional LODO dimension selection are unchanged.
 
 BLEURT-20 is the only reference-based evaluator. The label is an automatic
 pseudo-label because BLEURT does not define an official binary correctness cutoff.
@@ -45,7 +50,9 @@ The equivalent commands are:
 !python sala_kaggle.py \
     --output-dir /kaggle/working/sala_qwen25_g14_triviaqa_bleurt \
     --settings G14 \
-    --samples-per-domain 0
+    --samples-per-domain 0 \
+    --classifier-loss logit_adjusted \
+    --logit-adjustment-tau 1.0
 ```
 
 The notebook defaults to a fixed 32-dimensional projection per layer. This is the
@@ -69,15 +76,20 @@ The compact CSV contains one row per TriviaQA target question:
 - `ground_truth_text` (highest-scoring reference alias)
 - `ground_truth_label`
 - `bleurt_score`
+- `raw_logit`
 - `sala_probability`
 - `predicted_label`
+- `classifier_loss`, `logit_adjustment_tau`, `training_logit_adjustment`
+- `source_train_prior_0`, `source_train_prior_1`
 - `setting`, `source_domain`, `target_domain`, `split`
 - `sala_threshold`
 - `ground_truth_answers`
 
-`sala_probability` is the sigmoid probability assigned to class `1 =
-BLEURT-correct/non-hallucinated`. `predicted_label` applies a threshold calibrated
-only on the combined source validation partitions.
+Following Equation 10, the prior adjustment is added only inside the training loss.
+`raw_logit` is the unadjusted inference logit, `sala_probability = sigmoid(raw_logit)`,
+and `predicted_label = int(raw_logit >= 0)` (probability threshold `0.5`). The class
+priors and adjustment are recorded for auditability. See Menon et al.,
+[Long-Tail Learning via Logit Adjustment](https://arxiv.org/abs/2007.07314).
 
 Results are written to:
 

@@ -78,8 +78,14 @@ FINAL_COLUMNS = [
     "ground_truth_text",
     "ground_truth_label",
     "bleurt_score",
+    "raw_logit",
     "sala_probability",
     "predicted_label",
+    "classifier_loss",
+    "logit_adjustment_tau",
+    "training_logit_adjustment",
+    "source_train_prior_0",
+    "source_train_prior_1",
     "split",
     "sala_threshold",
     "ground_truth_answers",
@@ -130,6 +136,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs-probe-selection", type=int, default=40)
     parser.add_argument("--epochs-proj", type=int, default=40)
     parser.add_argument("--epochs-erm", type=int, default=40)
+    parser.add_argument(
+        "--classifier-loss",
+        choices=["logit_adjusted", "bce"],
+        default="logit_adjusted",
+        help="Loss for the final MLP; logit_adjusted implements Menon et al. Eq. 10",
+    )
+    parser.add_argument(
+        "--logit-adjustment-tau",
+        type=float,
+        default=1.0,
+        help="Positive tau multiplying source-training log priors in logit-adjusted loss",
+    )
     parser.add_argument("--lam-inv", type=float, default=1.0)
     parser.add_argument("--lam-sep", type=float, default=0.4)
     parser.add_argument("--lam-reg", type=float, default=0.1)
@@ -149,6 +167,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Projection dimension and epoch counts must be positive")
     if args.epochs_proj_selection < 1 or args.epochs_probe_selection < 1:
         raise ValueError("LODO projection/probe epoch counts must be positive")
+    if args.logit_adjustment_tau <= 0:
+        raise ValueError("--logit-adjustment-tau must be positive")
     candidates = [int(value.strip()) for value in args.proj_dim_candidates.split(",") if value.strip()]
     if args.use_lodo_dim and not candidates:
         raise ValueError("--use-lodo-dim requires at least one --proj-dim-candidates value")
@@ -722,6 +742,11 @@ def binary_metrics(labels: Sequence[int], predictions: Sequence[int], scores: Se
 
 
 def predict_scores(model, features: np.ndarray, device, batch_size: int = 256) -> np.ndarray:
+    logits = predict_logits(model, features, device, batch_size=batch_size)
+    return 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
+
+
+def predict_logits(model, features: np.ndarray, device, batch_size: int = 256) -> np.ndarray:
     import torch
 
     output: list[np.ndarray] = []
@@ -729,7 +754,7 @@ def predict_scores(model, features: np.ndarray, device, batch_size: int = 256) -
     with torch.inference_mode():
         for start in range(0, len(features), batch_size):
             batch = torch.from_numpy(features[start:start + batch_size]).float().to(device)
-            output.append(torch.sigmoid(model(batch)).float().cpu().numpy())
+            output.append(model(batch).float().cpu().numpy())
     return np.concatenate(output).reshape(-1)
 
 
@@ -763,7 +788,7 @@ def training_manifest(setting: str, args: argparse.Namespace, output_dir: Path) 
             "bleurt_scores_sha256": file_sha256(score_path),
         }
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "setting": setting,
         "mapping": mapping,
         "inputs_sha256": sha256_json(manifests),
@@ -775,12 +800,14 @@ def training_manifest(setting: str, args: argparse.Namespace, output_dir: Path) 
         "epochs_probe_selection": args.epochs_probe_selection,
         "epochs_proj": args.epochs_proj,
         "epochs_erm": args.epochs_erm,
+        "classifier_loss": args.classifier_loss,
+        "logit_adjustment_tau": args.logit_adjustment_tau,
         "lam_inv": args.lam_inv,
         "lam_sep": args.lam_sep,
         "lam_reg": args.lam_reg,
         "seed": args.seed,
         "source_split": "per-domain 67.5% train, 7.5% validation, 25% source test; stratified",
-        "target_policy": "full target domain; no target labels used for fitting or threshold calibration",
+        "target_policy": "full target domain; no target labels used for fitting or model selection",
     }
 
 
@@ -824,7 +851,12 @@ def train_setting(setting: str, args: argparse.Namespace, output_dir: Path) -> t
     import torch
 
     from models.projections import compute_isr_init_W, train_layerwise_invariant_projection
-    from utils.helpers import seed_everything, select_best_proj_dim_lodo, train_erm
+    from utils.helpers import (
+        binary_logit_adjustment,
+        seed_everything,
+        select_best_proj_dim_lodo,
+        train_erm,
+    )
 
     setting_dir = output_dir / "results" / setting
     current_manifest = training_manifest(setting, args, output_dir)
@@ -1006,11 +1038,38 @@ def train_setting(setting: str, args: argparse.Namespace, output_dir: Path) -> t
         lr=1e-3,
         wd=1e-4,
         verbose=False,
+        loss_name=args.classifier_loss,
+        logit_adjustment_tau=args.logit_adjustment_tau,
     )
+    if args.classifier_loss == "logit_adjusted":
+        training_logit_adjustment, loss_details = binary_logit_adjustment(
+            y_train, tau=args.logit_adjustment_tau
+        )
+    else:
+        training_logit_adjustment = 0.0
+        counts = np.bincount(y_train, minlength=2).astype(np.int64)
+        priors = counts.astype(np.float64) / counts.sum()
+        loss_details = {
+            "tau": None,
+            "class_counts": {"0": int(counts[0]), "1": int(counts[1])},
+            "class_priors": {"0": float(priors[0]), "1": float(priors[1])},
+            "positive_logit_adjustment": 0.0,
+            "training_formula": "BCEWithLogits(raw_logit, label)",
+            "inference_formula": "sala_probability = sigmoid(raw_logit)",
+        }
     val_scores = predict_scores(model, z_val_all, device)
     source_test_scores = predict_scores(model, z_source_test_all, device)
-    target_scores = predict_scores(model, z_target_all, device)
-    threshold, threshold_summary = calibrate_threshold(val_scores.tolist(), y_val.tolist())
+    target_logits = predict_logits(model, z_target_all, device)
+    target_scores = 1.0 / (1.0 + np.exp(-np.clip(target_logits, -80.0, 80.0)))
+    if args.classifier_loss == "logit_adjusted":
+        threshold = 0.5
+        threshold_summary = {
+            "objective": "Menon et al. Eq. 10 inference: argmax of unadjusted logits",
+            "probability_threshold": threshold,
+            "source_validation_used_for_threshold": False,
+        }
+    else:
+        threshold, threshold_summary = calibrate_threshold(val_scores.tolist(), y_val.tolist())
     source_test_predictions = (source_test_scores >= threshold).astype(np.int64)
     target_predictions = (target_scores >= threshold).astype(np.int64)
 
@@ -1019,7 +1078,10 @@ def train_setting(setting: str, args: argparse.Namespace, output_dir: Path) -> t
         for row in read_jsonl(output_dir / "bleurt" / target_domain / "scores.jsonl")
     }
     results = []
-    for row, label, score, prediction in zip(target_rows, target_labels, target_scores, target_predictions):
+    priors = loss_details["class_priors"]
+    for row, label, raw_logit, score, prediction in zip(
+        target_rows, target_labels, target_logits, target_scores, target_predictions
+    ):
         judged = target_bleurt[str(row["id"])]
         results.append({
             **row,
@@ -1030,13 +1092,21 @@ def train_setting(setting: str, args: argparse.Namespace, output_dir: Path) -> t
             "ground_truth_text": judged["ground_truth_text"],
             "ground_truth_label": int(label),
             "bleurt_score": float(judged["bleurt_score"]),
+            "raw_logit": float(raw_logit),
             "sala_probability": float(score),
             "predicted_label": int(prediction),
+            "classifier_loss": args.classifier_loss,
+            "logit_adjustment_tau": (
+                args.logit_adjustment_tau if args.classifier_loss == "logit_adjusted" else None
+            ),
+            "training_logit_adjustment": training_logit_adjustment,
+            "source_train_prior_0": priors["0"],
+            "source_train_prior_1": priors["1"],
             "split": "target_evaluation",
             "sala_threshold": threshold,
         })
     summary = {
-        "schema_version": 1,
+        "schema_version": 2,
         "setting": setting,
         "source_domain": "+".join(sources),
         "source_domains": sources,
@@ -1046,7 +1116,11 @@ def train_setting(setting: str, args: argparse.Namespace, output_dir: Path) -> t
         "bleurt_threshold": args.bleurt_threshold,
         "label_definition": "1 = correct/non-hallucinated when max BLEURT-20 over aliases >= threshold; 0 otherwise",
         "label_warning": "BLEURT labels are automatic pseudo-labels, not human correctness annotations.",
-        "sala_probability_definition": "sigmoid probability of BLEURT-correct/non-hallucinated from the source-trained SALA classifier",
+        "sala_probability_definition": "sigmoid of the final MLP raw, unadjusted inference logit for BLEURT-correct/non-hallucinated",
+        "classifier_loss": args.classifier_loss,
+        "logit_adjustment": loss_details,
+        "logit_adjustment_reference": "Menon et al., Long-Tail Learning via Logit Adjustment, arXiv:2007.07314, Eq. 10",
+        "feature_extraction_changed": False,
         "sala_threshold": threshold,
         "threshold_calibration": threshold_summary,
         "best_source_validation_auroc_during_training": best_source_val_auc,

@@ -79,11 +79,38 @@ def eval_auc_on_numpy(model, X_np, y_np, device, batch_size=256):
     )
     return eval_auc_loader(model, loader, device)
 
+
+def binary_logit_adjustment(labels: np.ndarray, tau: float = 1.0):
+    """Return Menon et al.'s binary training-logit adjustment and its inputs.
+
+    The returned scalar is added to the positive-class logit *only inside the
+    training loss*. Inference continues to use the model's raw, unadjusted logit.
+    """
+    labels = np.asarray(labels, dtype=np.int64).reshape(-1)
+    if labels.size == 0 or not np.isin(labels, [0, 1]).all():
+        raise ValueError("Logit adjustment requires nonempty binary labels")
+    if tau <= 0:
+        raise ValueError("Logit-adjustment tau must be positive")
+    counts = np.bincount(labels, minlength=2).astype(np.int64)
+    if np.any(counts == 0):
+        raise ValueError("Logit adjustment requires both classes in source training data")
+    priors = counts.astype(np.float64) / counts.sum()
+    adjustment = float(tau * np.log(priors[1] / priors[0]))
+    return adjustment, {
+        "tau": float(tau),
+        "class_counts": {"0": int(counts[0]), "1": int(counts[1])},
+        "class_priors": {"0": float(priors[0]), "1": float(priors[1])},
+        "positive_logit_adjustment": adjustment,
+        "training_formula": "BCEWithLogits(raw_logit + tau * log(prior_1 / prior_0), label)",
+        "inference_formula": "sala_probability = sigmoid(raw_logit); predicted_label = int(raw_logit >= 0)",
+    }
+
 def train_erm(
     Xtr: np.ndarray, y_tr: np.ndarray,
     Xval: np.ndarray, y_val: np.ndarray,
     device, epochs: int = 50, batch_size: int = 128,
     lr: float = 1e-3, wd: float = 1e-4, verbose: bool = True,
+    loss_name: str = "bce", logit_adjustment_tau: float = 1.0,
 ):
     Xtr_t = torch.from_numpy(Xtr).float()
     Xval_t = torch.from_numpy(Xval).float()
@@ -100,6 +127,13 @@ def train_erm(
     model = StrongMLP(input_dim=Xtr.shape[1], act='mish').to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
     bce = nn.BCEWithLogitsLoss()
+    if loss_name not in {"bce", "logit_adjusted"}:
+        raise ValueError(f"Unsupported final-classifier loss: {loss_name}")
+    training_logit_adjustment = 0.0
+    if loss_name == "logit_adjusted":
+        training_logit_adjustment, _ = binary_logit_adjustment(
+            y_tr, tau=logit_adjustment_tau
+        )
 
     best_auc = 0.0
     best_state = None
@@ -109,7 +143,8 @@ def train_erm(
         for xb, yb in tr_loader:
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True).float()
-            loss = bce(model(xb), yb)
+            logits_for_loss = model(xb) + training_logit_adjustment
+            loss = bce(logits_for_loss, yb)
             opt.zero_grad()
             loss.backward()
             opt.step()

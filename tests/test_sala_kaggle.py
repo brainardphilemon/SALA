@@ -17,6 +17,7 @@ from sala_kaggle import (
     source_split_indices,
     stack_last_token_features,
 )
+from utils.helpers import binary_logit_adjustment
 
 
 class SalaKaggleTests(unittest.TestCase):
@@ -77,8 +78,14 @@ class SalaKaggleTests(unittest.TestCase):
             "ground_truth_text": "Reference",
             "ground_truth_label": 1,
             "bleurt_score": 0.9,
+            "raw_logit": 1.4,
             "sala_probability": 0.8,
             "predicted_label": 1,
+            "classifier_loss": "logit_adjusted",
+            "logit_adjustment_tau": 1.0,
+            "training_logit_adjustment": -0.7,
+            "source_train_prior_0": 2 / 3,
+            "source_train_prior_1": 1 / 3,
             "split": "target_evaluation",
             "sala_threshold": 0.55,
             "ground_truth_answers": ["Reference", "Alias"],
@@ -92,6 +99,18 @@ class SalaKaggleTests(unittest.TestCase):
         self.assertIn("sala_probability", saved[0])
         self.assertNotIn("hide_score", saved[0])
         self.assertEqual(json.loads(saved[0]["ground_truth_answers"]), ["Reference", "Alias"])
+
+    def test_binary_logit_adjustment_matches_menon_equation_10(self):
+        adjustment, details = binary_logit_adjustment(
+            np.asarray([0, 0, 0, 1], dtype=np.int64), tau=1.0
+        )
+        self.assertAlmostEqual(adjustment, math.log(0.25 / 0.75))
+        self.assertEqual(details["class_counts"], {"0": 3, "1": 1})
+        self.assertEqual(details["class_priors"], {"0": 0.75, "1": 0.25})
+
+    def test_binary_logit_adjustment_requires_both_classes(self):
+        with self.assertRaisesRegex(ValueError, "both classes"):
+            binary_logit_adjustment(np.asarray([1, 1], dtype=np.int64), tau=1.0)
 
     def test_qwen_replay_produces_one_vector_per_layer(self):
         import torch
