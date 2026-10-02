@@ -24,6 +24,10 @@ logs a SALA correctness probability plus the input/output/reference text and lab
 - To reproduce Kaggle V1 exactly (G14, LODO, BCE, and source-validation threshold),
   see [the V1 reproduction guide](docs/KAGGLE_QWEN_G14_TRIVIAQA_V1_REPRO.md) or
   import [`qwen25_7b_sala_g14_triviaqa_v1_repro.ipynb`](kaggle/qwen25_7b_sala_g14_triviaqa_v1_repro.ipynb).
+- For the custom V1-compatible six-source experiment (the original three plus
+  PopQA, WebQuestions, and HotpotQA, with TriviaQA still unseen), see
+  [the six-source guide](docs/KAGGLE_QWEN_G14_6SRC_TRIVIAQA_V1.md) or import
+  [`qwen25_7b_sala_g14_6src_triviaqa_v1.ipynb`](kaggle/qwen25_7b_sala_g14_6src_triviaqa_v1.ipynb).
 - For G15 with the complete NQ-Open validation split as target, see
   [the G15 guide](docs/KAGGLE_QWEN_G15_NQ_BLEURT.md) or import
   [`qwen25_7b_sala_g15_nq_bleurt.ipynb`](kaggle/qwen25_7b_sala_g15_nq_bleurt.ipynb).
