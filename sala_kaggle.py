@@ -1,10 +1,11 @@
-"""Kaggle pipeline for SALA G3/G5/G14/G15 with Qwen2.5-7B and BLEURT-20 labels.
+"""Kaggle pipeline for SALA with Qwen2.5-7B and BLEURT-20 labels.
 
 Official mappings are preserved:
   G3: TruthfulQA -> TriviaQA
   G5: SciQ -> NQ-Open
   G14: TruthfulQA + NQ-Open + SciQ -> TriviaQA
   G15: TruthfulQA + SciQ + TriviaQA -> NQ-Open
+  G14_6SRC: TruthfulQA + NQ-Open + SciQ + PopQA + WebQuestions + HotpotQA -> TriviaQA
 
 BLEURT-20 is the only reference-based correctness evaluator. The pipeline extracts
 the final answer-token representation at every Qwen layer, matching the feature
@@ -39,6 +40,10 @@ SETTING_MAP = {
     "G5": {"source": "sciq", "target": "nq_open"},
     "G14": {"source": ["tqa", "nq_open", "sciq"], "target": "triviaqa"},
     "G15": {"source": ["tqa", "sciq", "triviaqa"], "target": "nq_open"},
+    "G14_6SRC": {
+        "source": ["tqa", "nq_open", "sciq", "popqa", "web_questions", "hotpotqa"],
+        "target": "triviaqa",
+    },
 }
 
 DATASET_SPECS = {
@@ -64,6 +69,24 @@ DATASET_SPECS = {
         "repo": "google-research-datasets/nq_open",
         "revision": "5dd9790a83002ad084ddeb7c420dc716852c6f28",
         "config": "nq_open",
+        "split": "validation",
+    },
+    "popqa": {
+        "repo": "akariasai/PopQA",
+        "revision": "098765c79ea10a2cb19c828324e33281b8336ec0",
+        "config": None,
+        "split": "test",
+    },
+    "web_questions": {
+        "repo": "stanfordnlp/web_questions",
+        "revision": "0e473cbe21d1e91ec18da343644498be6a3f5454",
+        "config": None,
+        "split": "train",
+    },
+    "hotpotqa": {
+        "repo": "hotpotqa/hotpot_qa",
+        "revision": "1908d6afbbead072334abe2965f91bd2709910ab",
+        "config": "distractor",
         "split": "validation",
     },
 }
@@ -260,6 +283,17 @@ def _unique_texts(values: Iterable[Any]) -> list[str]:
     return list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
 
 
+def _json_string_list(value: Any, domain: str, field: str) -> list[str]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{domain} field {field} is not a valid JSON list") from exc
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{domain} field {field} must be a list")
+    return _unique_texts(value)
+
+
 def load_domain_records(domain: str, args: argparse.Namespace) -> list[dict[str, Any]]:
     from datasets import load_dataset
 
@@ -290,6 +324,15 @@ def load_domain_records(domain: str, args: argparse.Namespace) -> list[dict[str,
         elif domain == "nq_open":
             example_id = str(index)
             references = _unique_texts(example["answer"])
+        elif domain == "popqa":
+            example_id = str(example["id"])
+            references = _json_string_list(example["possible_answers"], domain, "possible_answers")
+        elif domain == "web_questions":
+            example_id = str(index)
+            references = _unique_texts(example["answers"])
+        elif domain == "hotpotqa":
+            example_id = str(example["id"])
+            references = _unique_texts([example["answer"]])
         else:
             raise ValueError(f"Unsupported domain: {domain}")
         seen.add(example_id)

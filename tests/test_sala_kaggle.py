@@ -10,6 +10,7 @@ import numpy as np
 from sala_kaggle import (
     FINAL_COLUMNS,
     SETTING_MAP,
+    _json_string_list,
     calibrate_threshold,
     csv_dump_atomic,
     required_domains,
@@ -56,6 +57,23 @@ class SalaKaggleTests(unittest.TestCase):
         self.assertEqual(
             required_domains(["G15"]),
             ["tqa", "sciq", "triviaqa", "nq_open"],
+        )
+
+    def test_custom_g14_six_source_mapping_keeps_triviaqa_unseen(self):
+        self.assertEqual(
+            source_domains("G14_6SRC"),
+            ["tqa", "nq_open", "sciq", "popqa", "web_questions", "hotpotqa"],
+        )
+        self.assertEqual(SETTING_MAP["G14_6SRC"]["target"], "triviaqa")
+        self.assertEqual(
+            required_domains(["G14_6SRC"]),
+            ["tqa", "nq_open", "sciq", "popqa", "web_questions", "hotpotqa", "triviaqa"],
+        )
+
+    def test_popqa_json_aliases_are_parsed_and_deduplicated(self):
+        self.assertEqual(
+            _json_string_list('["Paris", "Paris", "City of Paris"]', "popqa", "possible_answers"),
+            ["Paris", "City of Paris"],
         )
 
     def test_probability_threshold_uses_one_as_correct(self):
