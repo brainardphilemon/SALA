@@ -125,6 +125,13 @@ def default_output_dir() -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", default=default_output_dir())
+    parser.add_argument(
+        "--input-artifact-dir",
+        help=(
+            "Read existing generation and BLEURT artifacts from this directory while writing "
+            "new training results to --output-dir. Supported with --stage train."
+        ),
+    )
     parser.add_argument("--settings", nargs="+", choices=sorted(SETTING_MAP), default=["G3", "G5"])
     parser.add_argument("--stage", choices=["all", "generate", "bleurt", "train"], default="all")
     parser.add_argument("--model", default=DEFAULT_MODEL)
@@ -180,6 +187,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    if args.input_artifact_dir and args.stage != "train":
+        raise ValueError("--input-artifact-dir is supported only with --stage train")
     if args.samples_per_domain < 0:
         raise ValueError("--samples-per-domain must be nonnegative")
     if args.max_new_tokens < 2 or args.max_input_tokens < 1:
@@ -210,6 +219,16 @@ def json_dump_atomic(path: Path, value: Any) -> None:
         temporary = Path(stream.name)
         json.dump(value, stream, ensure_ascii=False, indent=2, allow_nan=False)
         stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+def npz_dump_atomic(path: Path, **arrays: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("wb", dir=path.parent, suffix=".npz", delete=False) as stream:
+        temporary = Path(stream.name)
+        np.savez(stream, **arrays)
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temporary, path)
@@ -819,15 +838,15 @@ def project_target_layer(
     return result
 
 
-def training_manifest(setting: str, args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
+def training_manifest(setting: str, args: argparse.Namespace, artifact_dir: Path) -> dict[str, Any]:
     mapping = SETTING_MAP[setting]
     manifests = {}
     domains = [*source_domains(setting), str(mapping["target"])]
     for domain in domains:
-        score_path = output_dir / "bleurt" / domain / "scores.jsonl"
+        score_path = artifact_dir / "bleurt" / domain / "scores.jsonl"
         manifests[domain] = {
-            "generation": json.loads((output_dir / "generation" / domain / "manifest.json").read_text()),
-            "bleurt": json.loads((output_dir / "bleurt" / domain / "manifest.json").read_text()),
+            "generation": json.loads((artifact_dir / "generation" / domain / "manifest.json").read_text()),
+            "bleurt": json.loads((artifact_dir / "bleurt" / domain / "manifest.json").read_text()),
             "bleurt_scores_sha256": file_sha256(score_path),
         }
     return {
@@ -854,9 +873,9 @@ def training_manifest(setting: str, args: argparse.Namespace, output_dir: Path) 
     }
 
 
-def load_labels(domain: str, args: argparse.Namespace, output_dir: Path) -> tuple[list[dict[str, Any]], np.ndarray]:
-    rows = read_jsonl(output_dir / "generation" / domain / "rows.jsonl")
-    scored = read_jsonl(output_dir / "bleurt" / domain / "scores.jsonl")
+def load_labels(domain: str, args: argparse.Namespace, artifact_dir: Path) -> tuple[list[dict[str, Any]], np.ndarray]:
+    rows = read_jsonl(artifact_dir / "generation" / domain / "rows.jsonl")
+    scored = read_jsonl(artifact_dir / "bleurt" / domain / "scores.jsonl")
     by_id = {str(row["id"]): row for row in scored}
     if len(by_id) != len(rows):
         raise ValueError(f"Incomplete BLEURT scores for {domain}")
@@ -890,7 +909,12 @@ def source_split_indices(labels: np.ndarray, setting: str, domain: str) -> tuple
     return trainval_idx[train_pos], trainval_idx[val_pos], test_idx
 
 
-def train_setting(setting: str, args: argparse.Namespace, output_dir: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def train_setting(
+    setting: str,
+    args: argparse.Namespace,
+    output_dir: Path,
+    artifact_dir: Path | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     import torch
 
     from models.projections import compute_isr_init_W, train_layerwise_invariant_projection
@@ -901,8 +925,9 @@ def train_setting(setting: str, args: argparse.Namespace, output_dir: Path) -> t
         train_erm,
     )
 
+    artifact_dir = output_dir if artifact_dir is None else artifact_dir
     setting_dir = output_dir / "results" / setting
-    current_manifest = training_manifest(setting, args, output_dir)
+    current_manifest = training_manifest(setting, args, artifact_dir)
     prepare_manifest(setting_dir / "manifest.json", current_manifest)
     result_path = setting_dir / "results.jsonl"
     summary_path = setting_dir / "summary.json"
@@ -912,15 +937,15 @@ def train_setting(setting: str, args: argparse.Namespace, output_dir: Path) -> t
     mapping = SETTING_MAP[setting]
     sources = source_domains(setting)
     target_domain = str(mapping["target"])
-    target_rows, target_labels = load_labels(target_domain, args, output_dir)
+    target_rows, target_labels = load_labels(target_domain, args, artifact_dir)
     target_features = np.load(
-        output_dir / "generation" / target_domain / "features.npy", mmap_mode="r"
+        artifact_dir / "generation" / target_domain / "features.npy", mmap_mode="r"
     )
 
     source_bundles: list[dict[str, Any]] = []
     for domain_id, domain in enumerate(sources):
-        rows, labels = load_labels(domain, args, output_dir)
-        features = np.load(output_dir / "generation" / domain / "features.npy", mmap_mode="r")
+        rows, labels = load_labels(domain, args, artifact_dir)
+        features = np.load(artifact_dir / "generation" / domain / "features.npy", mmap_mode="r")
         if features.shape[1:] != target_features.shape[1:]:
             raise ValueError(f"Feature shapes differ between {domain} and {target_domain}")
         train_idx, val_idx, test_idx = source_split_indices(labels, setting, domain)
@@ -973,7 +998,39 @@ def train_setting(setting: str, args: argparse.Namespace, output_dir: Path) -> t
     if args.use_lodo_dim and not candidate_dims:
         raise ValueError("No --proj-dim-candidates fit the model hidden size")
 
+    checkpoint_dir = setting_dir / "projection_checkpoints"
+    prepare_manifest(checkpoint_dir / "manifest.json", current_manifest)
+
     for layer in range(num_layers):
+        checkpoint_path = checkpoint_dir / f"layer_{layer:02d}.npz"
+        if checkpoint_path.exists():
+            with np.load(checkpoint_path, allow_pickle=False) as checkpoint:
+                saved_layer = int(np.asarray(checkpoint["layer"]).item())
+                if saved_layer != layer:
+                    raise ValueError(
+                        f"Projection checkpoint layer mismatch at {checkpoint_path}: {saved_layer}"
+                    )
+                projection_dim = int(np.asarray(checkpoint["projection_dim"]).item())
+                selection_score = float(np.asarray(checkpoint["selection_score"]).item())
+                z_train_layers.append(np.asarray(checkpoint["z_train"], dtype=np.float32))
+                z_val_layers.append(np.asarray(checkpoint["z_val"], dtype=np.float32))
+                z_source_test_layers.append(
+                    np.asarray(checkpoint["z_source_test"], dtype=np.float32)
+                )
+                z_target_layers.append(np.asarray(checkpoint["z_target"], dtype=np.float32))
+            selected_proj_dims.append(projection_dim)
+            if args.use_lodo_dim:
+                lodo_selection.append({
+                    "layer": layer,
+                    "projection_dim": projection_dim,
+                    "selection_score": selection_score if math.isfinite(selection_score) else None,
+                })
+            print(
+                f"{setting} resumed projected layer {layer + 1}/{num_layers} dim={projection_dim}",
+                flush=True,
+            )
+            continue
+
         x_train = np.concatenate([
             np.asarray(bundle["features"][bundle["train_idx"], layer, :], dtype=np.float32)
             for bundle in source_bundles
@@ -1045,10 +1102,10 @@ def train_setting(setting: str, args: argparse.Namespace, output_dir: Path) -> t
         z_train = x_train @ projection
         z_mean = z_train.mean(axis=0, keepdims=True)
         z_std = z_train.std(axis=0, keepdims=True) + 1e-6
-        z_train_layers.append((z_train - z_mean) / z_std)
-        z_val_layers.append((x_val @ projection - z_mean) / z_std)
-        z_source_test_layers.append((x_source_test @ projection - z_mean) / z_std)
-        z_target_layers.append(project_target_layer(
+        z_train_layer = (z_train - z_mean) / z_std
+        z_val_layer = (x_val @ projection - z_mean) / z_std
+        z_source_test_layer = (x_source_test @ projection - z_mean) / z_std
+        z_target_layer = project_target_layer(
             target_features,
             layer,
             mean,
@@ -1057,7 +1114,26 @@ def train_setting(setting: str, args: argparse.Namespace, output_dir: Path) -> t
             z_mean,
             z_std,
             args.projection_chunk_size,
-        ))
+        )
+        selection_score = (
+            float(lodo_selection[-1]["selection_score"])
+            if args.use_lodo_dim and lodo_selection[-1]["selection_score"] is not None
+            else float("nan")
+        )
+        npz_dump_atomic(
+            checkpoint_path,
+            layer=np.asarray(layer, dtype=np.int64),
+            projection_dim=np.asarray(projection_dim, dtype=np.int64),
+            selection_score=np.asarray(selection_score, dtype=np.float64),
+            z_train=np.asarray(z_train_layer, dtype=np.float32),
+            z_val=np.asarray(z_val_layer, dtype=np.float32),
+            z_source_test=np.asarray(z_source_test_layer, dtype=np.float32),
+            z_target=np.asarray(z_target_layer, dtype=np.float32),
+        )
+        z_train_layers.append(z_train_layer)
+        z_val_layers.append(z_val_layer)
+        z_source_test_layers.append(z_source_test_layer)
+        z_target_layers.append(z_target_layer)
         print(
             f"{setting} projected layer {layer + 1}/{num_layers} dim={projection_dim}",
             flush=True,
@@ -1118,7 +1194,7 @@ def train_setting(setting: str, args: argparse.Namespace, output_dir: Path) -> t
 
     target_bleurt = {
         str(row["id"]): row
-        for row in read_jsonl(output_dir / "bleurt" / target_domain / "scores.jsonl")
+        for row in read_jsonl(artifact_dir / "bleurt" / target_domain / "scores.jsonl")
     }
     results = []
     priors = loss_details["class_priors"]
@@ -1204,6 +1280,13 @@ def run(args: argparse.Namespace) -> None:
     validate_args(args)
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    artifact_dir = (
+        Path(args.input_artifact_dir).expanduser().resolve()
+        if args.input_artifact_dir
+        else output_dir
+    )
+    if not artifact_dir.is_dir():
+        raise FileNotFoundError(f"Input artifact directory does not exist: {artifact_dir}")
     domains = required_domains(args.settings)
     if args.stage in {"all", "generate"}:
         records_by_domain = {domain: load_domain_records(domain, args) for domain in domains}
@@ -1218,7 +1301,7 @@ def run(args: argparse.Namespace) -> None:
     all_rows: list[dict[str, Any]] = []
     summaries: dict[str, Any] = {}
     for setting in args.settings:
-        rows, summary = train_setting(setting, args, output_dir)
+        rows, summary = train_setting(setting, args, output_dir, artifact_dir=artifact_dir)
         all_rows.extend(rows)
         summaries[setting] = summary
     jsonl_dump_atomic(output_dir / "results.jsonl", all_rows)

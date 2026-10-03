@@ -11,8 +11,10 @@ from sala_kaggle import (
     FINAL_COLUMNS,
     SETTING_MAP,
     _json_string_list,
+    build_parser,
     calibrate_threshold,
     csv_dump_atomic,
+    npz_dump_atomic,
     required_domains,
     source_domains,
     source_split_indices,
@@ -22,6 +24,27 @@ from utils.helpers import binary_logit_adjustment
 
 
 class SalaKaggleTests(unittest.TestCase):
+    def test_train_stage_accepts_separate_read_only_artifact_directory(self):
+        args = build_parser().parse_args([
+            "--stage", "train",
+            "--input-artifact-dir", "/kaggle/input/previous-run",
+        ])
+        self.assertEqual(args.input_artifact_dir, "/kaggle/input/previous-run")
+
+    def test_projection_checkpoint_is_written_atomically(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "checkpoints" / "layer_00.npz"
+            npz_dump_atomic(
+                path,
+                layer=np.asarray(0, dtype=np.int64),
+                z_train=np.asarray([[1.0, 2.0]], dtype=np.float32),
+            )
+            with np.load(path, allow_pickle=False) as checkpoint:
+                self.assertEqual(int(checkpoint["layer"]), 0)
+                np.testing.assert_array_equal(
+                    checkpoint["z_train"], np.asarray([[1.0, 2.0]], dtype=np.float32)
+                )
+
     def test_official_g3_g5_mappings_are_preserved(self):
         self.assertEqual(SETTING_MAP["G3"], {"source": "tqa", "target": "triviaqa"})
         self.assertEqual(SETTING_MAP["G5"], {"source": "sciq", "target": "nq_open"})
