@@ -13,8 +13,13 @@ completed generation and BLEURT artifacts and reruns only the projection/final-M
 training stage. This is much shorter than rerunning the full pipeline.
 
 Use [`kaggle/qwen25_7b_sala_g14_6src_triviaqa_resume.ipynb`](../kaggle/qwen25_7b_sala_g14_6src_triviaqa_resume.ipynb).
-The notebook pins code commit `7d09466`, attaches the exact Version 6 output with
-`kagglehub`, and runs:
+The notebook pins code commit `7d09466` and reads the exact Version 6 artifacts
+from the private Kaggle dataset
+`nvthaai/sala-g14-6-source-triviaqa-version-6-artifacts`. Attach that dataset to
+the notebook before committing the run. The dataset was created directly from
+the timed-out Version 6 output, because Kaggle does not allow a committed
+non-interactive notebook to attach a cancelled notebook version dynamically.
+It then runs:
 
 ```bash
 python sala_kaggle.py \
@@ -44,4 +49,3 @@ Expected final files include:
 - `results/G14_6SRC/results.csv`
 - `results/G14_6SRC/results.jsonl`
 - `results/G14_6SRC/summary.json`
-
