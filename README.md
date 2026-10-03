@@ -28,6 +28,9 @@ logs a SALA correctness probability plus the input/output/reference text and lab
   PopQA, WebQuestions, and HotpotQA, with TriviaQA still unseen), see
   [the six-source guide](docs/KAGGLE_QWEN_G14_6SRC_TRIVIAQA_V1.md) or import
   [`qwen25_7b_sala_g14_6src_triviaqa_v1.ipynb`](kaggle/qwen25_7b_sala_g14_6src_triviaqa_v1.ipynb).
+- To continue that experiment from the completed generation and BLEURT artifacts
+  in Kaggle Version 6, use [the resume guide](docs/KAGGLE_QWEN_G14_6SRC_TRIVIAQA_RESUME.md)
+  and [`qwen25_7b_sala_g14_6src_triviaqa_resume.ipynb`](kaggle/qwen25_7b_sala_g14_6src_triviaqa_resume.ipynb).
 - For G15 with the complete NQ-Open validation split as target, see
   [the G15 guide](docs/KAGGLE_QWEN_G15_NQ_BLEURT.md) or import
   [`qwen25_7b_sala_g15_nq_bleurt.ipynb`](kaggle/qwen25_7b_sala_g15_nq_bleurt.ipynb).
