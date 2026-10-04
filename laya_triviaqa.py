@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run CPU-only LAYA hallucination detection over saved TriviaQA generations.
+"""Run LAYA hallucination detection over saved TriviaQA generations.
 
 The LAYA model receives only the question and the generated answer.  Saved
 BLEURT scores/references are joined afterward for evaluation, so the detector
@@ -11,26 +11,59 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import hashlib
 import os
 from pathlib import Path
 from typing import Any, Iterable
 
 
-QUESTION = {
+ASSISTANT_POLICY = [
+    "0) Answer the question truthfully and factually.",
+    "1) Do not fabricate facts or present uncertain information as verified.",
+    "2) Ensure the predicted answer is factually consistent with the question.",
+    "3) A hallucination occurs when the predicted answer is factually incorrect, fabricated, or contradicts established knowledge.",
+    "4) Do not mark an answer as hallucinated merely because it is short or lacks explanation.",
+    "5) If the predicted answer correctly answers the question, treat it as non-hallucinated.",
+]
+
+QUESTIONS = {
     "hallucination": {
         "type": "noul",
         "instructions": (
-            "Is the assistant answer factually incorrect, unsupported, irrelevant, "
-            "or otherwise hallucinated for the given trivia question?"
+            "Given `question` and `assistant_response`, determine whether the response contains any factual hallucination. "
+            "Evaluate whether the factual claims made in the response are correct and appropriate for answering the question, "
+            "using your own reliable knowledge. Do not mark a response as hallucinated merely because you are uncertain about a claim. "
+            "Assistant policy: " + " ".join(ASSISTANT_POLICY)
         ),
         "criteria": {
-            "false": "The answer is factually correct and directly answers the question.",
-            "true": "The answer is incorrect, unsupported, irrelevant, or hallucinated.",
+            "true": "The response contains at least one clearly false, fabricated, or contradictory factual claim relevant to the question.",
+            "false": "The response contains no clearly false or fabricated factual claims and is factually consistent with the question.",
         },
-        # Neutral labels reduce the documented true/false label sensitivity.
-        "labels": {"false": "B", "true": "A"},
-    }
+    },
+    "hallucination_type": {
+        "type": "choice",
+        "instructions": "Given `question` and `assistant_response`, classify the primary factuality issue in the response.",
+        "criteria": {
+            "none": "The response contains no identifiable factual hallucination.",
+            "wrong_answer": "The response gives an incorrect answer to the main question.",
+            "factual_error": "The main answer may be correct, but one or more factual claims are incorrect.",
+            "fabrication": "The response invents facts, entities, events, citations, statistics, quotations, studies, or other information.",
+            "internal_contradiction": "The response contains factual claims that contradict one another.",
+            "unverifiable": "A factual claim cannot be confidently verified or rejected using the evaluator's available knowledge.",
+        },
+    },
+    "severity": {
+        "type": "score",
+        "instructions": "Given `question` and `assistant_response`, rate how strongly any factuality problem affects the correctness of the answer.",
+        "criteria": [
+            "No hallucination: The answer is factually correct with no meaningful hallucination.",
+            "Minor: A small factual mistake is present, but the main answer to the question remains correct.",
+            "Moderate: A factual error or fabrication materially affects part of the answer.",
+            "Major: The main answer to the question is incorrect, fabricated, or substantially misleading.",
+        ],
+    },
 }
+CONFIG_ID = hashlib.sha256(json.dumps(QUESTIONS, sort_keys=True).encode("utf-8")).hexdigest()[:12]
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,6 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--domain", default="triviaqa")
     parser.add_argument("--model", default="convaiinnovations/laya")
     parser.add_argument("--revision", default=None)
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--max-samples", type=int, default=0)
@@ -76,8 +110,8 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def build_state(row: dict[str, Any]) -> dict[str, str]:
     return {
-        "trivia_question": str(row["input_text"]),
-        "assistant_answer": str(row["output_text"]),
+        "question": str(row["input_text"]),
+        "assistant_response": str(row["output_text"]),
     }
 
 
@@ -103,6 +137,13 @@ def main() -> None:
         raise ValueError("--threshold must be between 0 and 1")
     if args.batch_size < 1:
         raise ValueError("--batch-size must be positive")
+    import torch
+
+    device = "cuda" if args.device == "auto" and torch.cuda.is_available() else args.device
+    if device == "auto":
+        device = "cpu"
+    if device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is unavailable; enable a Kaggle GPU or use --device cpu")
 
     artifact_dir = Path(args.artifact_dir)
     output_dir = Path(args.output_dir)
@@ -122,18 +163,24 @@ def main() -> None:
 
     checkpoint_path = output_dir / "laya_triviaqa_rows.jsonl"
     completed_rows = read_jsonl(checkpoint_path) if checkpoint_path.exists() else []
+    stale = [row for row in completed_rows if row.get("laya_config_id") != CONFIG_ID]
+    if stale:
+        raise ValueError(
+            f"Checkpoint contains {len(stale)} rows from another LAYA task definition; "
+            "choose a new --output-dir to avoid mixing configurations"
+        )
     completed = {str(row["id"]): row for row in completed_rows}
     pending = [row for row in generated if str(row["id"]) not in completed]
     print(
         f"TriviaQA rows={len(generated)} completed={len(completed_rows)} pending={len(pending)}; "
-        f"CPU-only LAYA threshold={args.threshold}",
+        f"LAYA device={device} threshold={args.threshold}",
         flush=True,
     )
 
     if pending:
         import laya
 
-        load_kwargs: dict[str, Any] = {"device": "cpu"}
+        load_kwargs: dict[str, Any] = {"device": device}
         if args.revision:
             load_kwargs["revision"] = args.revision
         agent = laya.load(args.model, **load_kwargs)
@@ -143,7 +190,7 @@ def main() -> None:
             states = [build_state(row) for row in batch]
             predictions = agent.predict_batch(
                 states,
-                QUESTION,
+                QUESTIONS,
                 batch_size=len(states),
                 sort_by_length=False,
             )
@@ -152,6 +199,8 @@ def main() -> None:
                 row_id = str(source["id"])
                 judged = scored[row_id]
                 answer = prediction["answers"]["hallucination"]
+                issue = prediction["answers"]["hallucination_type"]
+                severity = prediction["answers"]["severity"]
                 probability = float(answer["noul"])
                 # BLEURT >= 0.5 means correct in the original run, hence not hallucinated.
                 ground_truth_hallucination = int(float(judged["bleurt_score"]) < 0.5)
@@ -163,12 +212,18 @@ def main() -> None:
                     "bleurt_score": float(judged["bleurt_score"]),
                     "ground_truth_hallucination_label": ground_truth_hallucination,
                     "laya_confidence_score": probability,
+                    "laya_hallucination_type": issue["choice"],
+                    "laya_hallucination_type_probabilities": json.dumps(issue["probabilities"], ensure_ascii=False),
+                    "laya_severity_score": float(severity["score"]),
+                    "laya_severity_probabilities": json.dumps(severity["probabilities"], ensure_ascii=False),
+                    "laya_severity_legend": json.dumps(severity["legend"], ensure_ascii=False),
                     "predicted_label": int(probability > args.threshold),
                     "predicted_label_text": "hallucinated" if probability > args.threshold else "not_hallucinated",
                     "threshold": args.threshold,
                     "laya_answer_confidence": float(answer.get("confidence", max(probability, 1.0 - probability))),
                     "laya_model": args.model,
-                    "device": "cpu",
+                    "laya_config_id": CONFIG_ID,
+                    "device": device,
                 })
             append_jsonl(checkpoint_path, saved)
             completed.update({str(row["id"]): row for row in saved})
@@ -180,7 +235,8 @@ def main() -> None:
     summary = {
         "domain": args.domain,
         "model": args.model,
-        "device": "cpu",
+        "device": device,
+        "laya_config_id": CONFIG_ID,
         "threshold_rule": f"hallucinated iff laya_confidence_score > {args.threshold}",
         "ground_truth_rule": "hallucinated iff BLEURT-20 score < 0.5",
         **metrics(ordered),

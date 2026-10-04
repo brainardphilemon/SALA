@@ -38,3 +38,25 @@ Outputs are written to `/kaggle/working/laya_triviaqa_cpu`:
 The result log includes the input text, Qwen output, selected reference,
 BLEURT score, BLEURT-derived hallucination label, LAYA probability/confidence,
 and predicted label.
+
+## Updated factuality definition (GPU notebook)
+
+`kaggle/laya_triviaqa_gpu_multijudge.ipynb` runs the revised LAYA task on a Kaggle
+GPU. Its state keys are `question` and `assistant_response`. The task definition
+uses the supplied factual hallucination criteria and assistant policy, and asks
+LAYA for three judgments in one batch: `hallucination` (`noul`),
+`hallucination_type` (`choice`), and `severity` (`score`). The notebook uses a new
+output directory, `/kaggle/working/laya_triviaqa_gpu_multijudge`, so results
+from the earlier definition cannot be mixed into this run.
+
+The JSONL and CSV log include the `noul` probability, predicted label (strictly
+greater than 0.5), issue type and its option probabilities, severity's expected
+level index, its probabilities and legend, plus the original BLEURT fields.
+Severity runs from 0 (no hallucination) to 3 (major) and may be fractional.
+These three LAYA judgments are independent outputs; the predicted binary label
+comes only from the `noul` probability. The model does not read the reference
+answer or BLEURT score.
+
+`laya_triviaqa.py` supports `--device auto` (default), `--device cpu`, and
+`--device cuda`; requesting CUDA without an available GPU fails immediately.
+An existing checkpoint created under a different task definition is rejected.
