@@ -69,6 +69,23 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
         return [json.loads(line) for line in stream if line.strip()]
 
 
+def read_saved_sources(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    if args.source_csv:
+        with Path(args.source_csv).open(encoding="utf-8", newline="") as stream:
+            source_rows = list(csv.DictReader(stream))
+        required = {"id", "input_text", "output_text", "ground_truth_text", "bleurt_score"}
+        if source_rows and not required.issubset(source_rows[0]):
+            raise ValueError(f"Saved result CSV lacks columns: {sorted(required - source_rows[0].keys())}")
+        # LAYA-specific predictions are deliberately discarded before Jev inference.
+        generated = [{"id": row["id"], "input_text": row["input_text"], "output_text": row["output_text"]} for row in source_rows]
+        scored = {str(row["id"]): {"ground_truth_text": row["ground_truth_text"], "bleurt_score": row["bleurt_score"]} for row in source_rows}
+        return generated, scored
+    artifact_dir = Path(args.artifact_dir)
+    generation_path = artifact_dir / "generation" / args.domain / "rows.jsonl"
+    bleurt_path = artifact_dir / "bleurt" / args.domain / "scores.jsonl"
+    return read_jsonl(generation_path), {str(row["id"]): row for row in read_jsonl(bleurt_path)}
+
+
 def append_jsonl(path: Path, row: dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
@@ -94,7 +111,9 @@ def metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--artifact-dir", required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--artifact-dir")
+    source.add_argument("--source-csv", help="Saved results.csv with question, Qwen answer, reference, and BLEURT score")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--domain", default="triviaqa")
     parser.add_argument("--model", default="jev-latest")
@@ -105,15 +124,11 @@ def main() -> None:
     if not os.environ.get("TYPESAFE_API_KEY"):
         parser.error("Set TYPESAFE_API_KEY (in Kaggle Secrets); never put the key in notebook source")
 
-    artifact_dir = Path(args.artifact_dir)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    generation_path = artifact_dir / "generation" / args.domain / "rows.jsonl"
-    bleurt_path = artifact_dir / "bleurt" / args.domain / "scores.jsonl"
-    generated = read_jsonl(generation_path)
+    generated, scored = read_saved_sources(args)
     if not generated:
-        raise ValueError(f"No generated rows in {generation_path}")
-    scored = {str(row["id"]): row for row in read_jsonl(bleurt_path)}
+        raise ValueError("No saved TriviaQA rows found")
     if args.max_samples:
         generated = generated[: args.max_samples]
     ids = [str(row["id"]) for row in generated]

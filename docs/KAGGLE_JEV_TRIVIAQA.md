@@ -3,7 +3,7 @@
 Use the separate notebook [`kaggle/jev_triviaqa_multijudge.ipynb`](../kaggle/jev_triviaqa_multijudge.ipynb). It calls the hosted Jev model through the [official TypeSafe Python SDK](https://github.com/typesafe-ai/typesafe-sdk-python); it does not run Qwen or BLEURT again.
 
 1. Create a new Kaggle notebook and upload/import the `.ipynb` file.
-2. Attach Kaggle dataset `nvthaai/sala-g14-6-source-triviaqa-version-6-artifacts` as input.
+2. Attach notebook output `nvthaai/laya-triviaqa-gpu-multijudge` as input. Its saved `results.csv` contains the original question, Qwen answer, ground-truth answer, and BLEURT score; LAYA predictions are not used.
 3. Enable Internet. GPU is unnecessary for this hosted API call.
 4. Add a Kaggle notebook secret named `TYPESAFE_API_KEY` and grant the notebook access. Do not paste the key into notebook code, logs, or GitHub.
 5. Run the notebook. `MAX_SAMPLES = 0` means all saved TriviaQA rows; set it to `1` first if you want to check one potentially billable Jev request.
