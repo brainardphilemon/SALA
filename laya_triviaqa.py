@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Run LAYA hallucination detection over saved TriviaQA generations.
+"""Run LAYA hallucination detection over saved TriviaQA answers.
 
-The LAYA model receives only the question and the generated answer.  Saved
-BLEURT scores/references are joined afterward for evaluation, so the detector
-does not see its ground-truth signal at inference time.
+LAYA receives the same assistant policy, formatted user message, and three
+question definitions as the Jev run. BLEURT/reference data is joined afterward.
 """
 
 from __future__ import annotations
@@ -29,12 +28,7 @@ ASSISTANT_POLICY = [
 QUESTIONS = {
     "hallucination": {
         "type": "noul",
-        "instructions": (
-            "Given `question` and `assistant_response`, determine whether the response contains any factual hallucination. "
-            "Evaluate whether the factual claims made in the response are correct and appropriate for answering the question, "
-            "using your own reliable knowledge. Do not mark a response as hallucinated merely because you are uncertain about a claim. "
-            "Assistant policy: " + " ".join(ASSISTANT_POLICY)
-        ),
+        "instructions": "Given `question` and `assistant_response`, determine whether the response contains any factual hallucination. Evaluate whether the factual claims made in the response are correct and appropriate for answering the question, using your own reliable knowledge. Do not mark a response as hallucinated merely because you are uncertain about a claim.",
         "criteria": {
             "true": "The response contains at least one clearly false, fabricated, or contradictory factual claim relevant to the question.",
             "false": "The response contains no clearly false or fabricated factual claims and is factually consistent with the question.",
@@ -63,12 +57,14 @@ QUESTIONS = {
         ],
     },
 }
-CONFIG_ID = hashlib.sha256(json.dumps(QUESTIONS, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+CONFIG_ID = hashlib.sha256(json.dumps({"assistant_policy": ASSISTANT_POLICY, "questions": QUESTIONS}, sort_keys=True).encode()).hexdigest()[:12]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--artifact-dir", required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--artifact-dir")
+    source.add_argument("--source-csv", help="Saved results.csv with question, Qwen answer, reference, and BLEURT score")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--domain", default="triviaqa")
     parser.add_argument("--model", default="convaiinnovations/laya")
@@ -84,6 +80,25 @@ def parse_args() -> argparse.Namespace:
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
     with path.open(encoding="utf-8") as stream:
         return [json.loads(line) for line in stream if line.strip()]
+
+
+def read_saved_sources(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    if args.source_csv:
+        with Path(args.source_csv).open(encoding="utf-8", newline="") as stream:
+            source_rows = list(csv.DictReader(stream))
+        required = {"id", "input_text", "output_text", "ground_truth_text", "bleurt_score"}
+        if source_rows and not required.issubset(source_rows[0]):
+            raise ValueError(f"Saved result CSV lacks columns: {sorted(required - source_rows[0].keys())}")
+        # Prior LAYA predictions, if present, are deliberately discarded.
+        generated = [{"id": row["id"], "input_text": row["input_text"], "output_text": row["output_text"]} for row in source_rows]
+        scored = {str(row["id"]): {"ground_truth_text": row["ground_truth_text"], "bleurt_score": row["bleurt_score"]} for row in source_rows}
+        return generated, scored
+    artifact_dir = Path(args.artifact_dir)
+    generation_path = artifact_dir / "generation" / args.domain / "rows.jsonl"
+    bleurt_path = artifact_dir / "bleurt" / args.domain / "scores.jsonl"
+    if not generation_path.is_file() or not bleurt_path.is_file():
+        raise FileNotFoundError(f"Missing generation or BLEURT file under {artifact_dir}")
+    return read_jsonl(generation_path), {str(row["id"]): row for row in read_jsonl(bleurt_path)}
 
 
 def append_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
@@ -108,10 +123,10 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     temporary.replace(path)
 
 
-def build_state(row: dict[str, Any]) -> dict[str, str]:
+def build_state(row: dict[str, Any]) -> dict[str, Any]:
     return {
-        "question": str(row["input_text"]),
-        "assistant_response": str(row["output_text"]),
+        "assistant_policy": ASSISTANT_POLICY,
+        "user_message": f"Question: {row['input_text']}\n\nPredicted Answer: {row['output_text']}",
     }
 
 
@@ -145,31 +160,31 @@ def main() -> None:
     if device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable; enable a Kaggle GPU or use --device cpu")
 
-    artifact_dir = Path(args.artifact_dir)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    generation_path = artifact_dir / "generation" / args.domain / "rows.jsonl"
-    bleurt_path = artifact_dir / "bleurt" / args.domain / "scores.jsonl"
-    if not generation_path.is_file() or not bleurt_path.is_file():
-        raise FileNotFoundError(f"Missing generation or BLEURT file under {artifact_dir}")
-
-    generated = read_jsonl(generation_path)
-    scored = {str(row["id"]): row for row in read_jsonl(bleurt_path)}
+    generated, scored = read_saved_sources(args)
+    if not generated:
+        raise ValueError("No saved TriviaQA rows found")
     if args.max_samples:
         generated = generated[: args.max_samples]
-    missing = [str(row["id"]) for row in generated if str(row["id"]) not in scored]
+    ids = [str(row["id"]) for row in generated]
+    if len(ids) != len(set(ids)):
+        raise ValueError("Saved source contains duplicate IDs")
+    missing = [row_id for row_id in ids if row_id not in scored]
     if missing:
         raise ValueError(f"Missing BLEURT scores for {len(missing)} rows; first={missing[0]}")
 
     checkpoint_path = output_dir / "laya_triviaqa_rows.jsonl"
     completed_rows = read_jsonl(checkpoint_path) if checkpoint_path.exists() else []
-    stale = [row for row in completed_rows if row.get("laya_config_id") != CONFIG_ID]
+    stale = [row for row in completed_rows if row.get("laya_config_id") != CONFIG_ID or row.get("laya_model") != args.model]
     if stale:
         raise ValueError(
             f"Checkpoint contains {len(stale)} rows from another LAYA task definition; "
             "choose a new --output-dir to avoid mixing configurations"
         )
     completed = {str(row["id"]): row for row in completed_rows}
+    if len(completed) != len(completed_rows):
+        raise ValueError("Checkpoint contains duplicate IDs")
     pending = [row for row in generated if str(row["id"]) not in completed]
     print(
         f"TriviaQA rows={len(generated)} completed={len(completed_rows)} pending={len(pending)}; "
@@ -211,7 +226,7 @@ def main() -> None:
                     "ground_truth_text": str(judged["ground_truth_text"]),
                     "bleurt_score": float(judged["bleurt_score"]),
                     "ground_truth_hallucination_label": ground_truth_hallucination,
-                    "laya_confidence_score": probability,
+                    "laya_hallucination_noul": probability,
                     "laya_hallucination_type": issue["choice"],
                     "laya_hallucination_type_probabilities": json.dumps(issue["probabilities"], ensure_ascii=False),
                     "laya_severity_score": float(severity["score"]),
@@ -220,7 +235,6 @@ def main() -> None:
                     "predicted_label": int(probability > args.threshold),
                     "predicted_label_text": "hallucinated" if probability > args.threshold else "not_hallucinated",
                     "threshold": args.threshold,
-                    "laya_answer_confidence": float(answer.get("confidence", max(probability, 1.0 - probability))),
                     "laya_model": args.model,
                     "laya_config_id": CONFIG_ID,
                     "device": device,
@@ -237,7 +251,7 @@ def main() -> None:
         "model": args.model,
         "device": device,
         "laya_config_id": CONFIG_ID,
-        "threshold_rule": f"hallucinated iff laya_confidence_score > {args.threshold}",
+        "threshold_rule": f"hallucinated iff laya_hallucination_noul > {args.threshold}",
         "ground_truth_rule": "hallucinated iff BLEURT-20 score < 0.5",
         **metrics(ordered),
     }
