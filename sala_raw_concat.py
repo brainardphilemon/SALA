@@ -78,15 +78,38 @@ def main() -> None:
     parser.add_argument("--epochs-erm", type=int, default=40)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train-device", default="cuda:0")
+    parser.add_argument("--hidden-dim", type=int, default=1024)
+    parser.add_argument("--hidden-layers", type=int, default=3,
+                        help="Number of width-matched hidden linear layers, excluding the output layer")
     args = parser.parse_args()
+    if args.hidden_dim < 1 or args.hidden_layers < 1:
+        parser.error("--hidden-dim and --hidden-layers must be positive")
 
     import torch
     from sklearn.metrics import roc_auc_score
     from torch import nn
     from torch.utils.data import DataLoader, Dataset
 
-    from models.classifiers import StrongMLP
     from utils.helpers import seed_everything
+
+    class RawConcatMLP(nn.Module):
+        """StrongMLP's residual pattern with a configurable number of hidden layers."""
+
+        def __init__(self, input_dim: int, hidden_dim: int, hidden_layers: int):
+            super().__init__()
+            self.fc_in = nn.Linear(input_dim, hidden_dim)
+            self.blocks = nn.ModuleList([
+                nn.Sequential(nn.LayerNorm(hidden_dim), nn.Mish(), nn.Dropout(0.2),
+                              nn.Linear(hidden_dim, hidden_dim))
+                for _ in range(hidden_layers - 1)
+            ])
+            self.out = nn.Linear(hidden_dim, 1)
+
+        def forward(self, x):
+            h = self.fc_in(x)
+            for block in self.blocks:
+                h = h + block(h)
+            return self.out(h).squeeze(-1)
 
     class TargetDataset(Dataset):
         def __init__(self, features):
@@ -142,14 +165,16 @@ def main() -> None:
     test_loader = DataLoader(test_ds, batch_size=256, shuffle=False, pin_memory=pin, num_workers=0)
     target_loader = DataLoader(TargetDataset(target_features), batch_size=256, shuffle=False,
                                pin_memory=pin, num_workers=0)
-    model = StrongMLP(input_dim=input_dim, hidden_dim=1024, dropout=0.2, act="mish").to(device)
+    model = RawConcatMLP(input_dim, args.hidden_dim, args.hidden_layers).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     loss_fn = nn.BCEWithLogitsLoss()
     checkpoint = output_dir / "training_checkpoint.pt"
     start_epoch, best_auc, best_epoch = 0, 0.0, None
     if checkpoint.exists():
         saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
-        if saved["input_dim"] != input_dim or saved["seed"] != args.seed:
+        if (saved["input_dim"] != input_dim or saved["seed"] != args.seed
+                or saved["hidden_dim"] != args.hidden_dim
+                or saved["hidden_layers"] != args.hidden_layers):
             raise ValueError("Checkpoint configuration mismatch")
         model.load_state_dict(saved["model"])
         optimizer.load_state_dict(saved["optimizer"])
@@ -173,9 +198,12 @@ def main() -> None:
         val_auc = float(roc_auc_score(y_val, val_logits))
         if val_auc > best_auc:
             best_auc, best_epoch = val_auc, epoch + 1
-            save_checkpoint(best_path, {"input_dim": input_dim, "model": model.state_dict(),
+            save_checkpoint(best_path, {"input_dim": input_dim, "hidden_dim": args.hidden_dim,
+                                        "hidden_layers": args.hidden_layers, "model": model.state_dict(),
                                         "best_epoch": best_epoch, "best_auc": best_auc})
         save_checkpoint(checkpoint, {"input_dim": input_dim, "seed": args.seed,
+                                     "hidden_dim": args.hidden_dim,
+                                     "hidden_layers": args.hidden_layers,
                                      "next_epoch": epoch + 1, "model": model.state_dict(),
                                      "optimizer": optimizer.state_dict(), "best_auc": best_auc,
                                      "best_epoch": best_epoch})
@@ -199,6 +227,8 @@ def main() -> None:
     ):
         judged = bleurt[str(row["id"])]
         results.append({**row, "setting": "G14_6SRC_RAW_CONCAT", "source_domains": source_names,
+                        "mlp_hidden_dimension": args.hidden_dim,
+                        "mlp_hidden_layers": args.hidden_layers,
                         "target_domain": target_name, "ground_truth_text": judged["ground_truth_text"],
                         "ground_truth_label": int(label), "bleurt_score": float(judged["bleurt_score"]),
                         "raw_logit": float(logit), "sala_probability": float(score),
@@ -209,7 +239,8 @@ def main() -> None:
         "target_domain": target_name, "model": "Qwen/Qwen2.5-7B-Instruct",
         "feature_policy": "flatten and concatenate all saved answer-token hidden states; no projection or scaling",
         "num_layers_including_embedding_output": n_layers, "hidden_size": hidden_size,
-        "mlp_input_dimension": input_dim, "mlp_hidden_dimension": 1024,
+        "mlp_input_dimension": input_dim, "mlp_hidden_dimension": args.hidden_dim,
+        "mlp_hidden_layers": args.hidden_layers,
         "mlp_activation": "mish", "mlp_dropout": 0.2,
         "epochs_erm": args.epochs_erm, "batch_size": 128, "learning_rate": 1e-3,
         "weight_decay": 1e-4, "classifier_loss": "bce", "seed": args.seed,
