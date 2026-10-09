@@ -4,6 +4,7 @@ Use [`kaggle/qwen25_7b_g14_6src_raw_concat.ipynb`](../kaggle/qwen25_7b_g14_6src_
 in a **separate Kaggle notebook**. Attach the private dataset
 `nvthaai/sala-g14-6-source-triviaqa-version-6-artifacts`, enable Internet and
 GPU T4 x2, then Save & Run All.
+The notebook pins implementation commit `b7f8f4b`.
 
 The notebook consumes the exact saved Qwen2.5-7B-Instruct question/answer rows,
 answer-token hidden states, and BLEURT-20 scores for all six training domains
