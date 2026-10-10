@@ -81,13 +81,23 @@ def main() -> None:
     parser.add_argument("--hidden-dim", type=int, default=1024)
     parser.add_argument("--hidden-layers", type=int, default=3,
                         help="Number of width-matched hidden linear layers, excluding the output layer")
+    parser.add_argument("--pooling", choices=("none", "dwclp", "max1d"), default="none")
+    parser.add_argument("--pool-kernel-size", type=int, default=3)
+    parser.add_argument("--pool-stride", type=int, default=2)
+    parser.add_argument("--dwclp-radius", type=int, default=2)
+    parser.add_argument("--dwclp-sigma", type=float, default=1.0)
     args = parser.parse_args()
     if args.hidden_dim < 1 or args.hidden_layers < 1:
         parser.error("--hidden-dim and --hidden-layers must be positive")
+    if args.pooling != "none" and (args.pool_kernel_size != 3 or args.pool_stride != 2):
+        parser.error("Pooling comparison requires a 3-layer window and stride 2")
+    if args.dwclp_radius < 1 or args.dwclp_sigma <= 0:
+        parser.error("DWCLP radius and sigma must be positive")
 
     import torch
     from sklearn.metrics import roc_auc_score
     from torch import nn
+    from torch.nn import functional as F
     from torch.utils.data import DataLoader, Dataset
 
     from utils.helpers import seed_everything
@@ -95,8 +105,17 @@ def main() -> None:
     class RawConcatMLP(nn.Module):
         """StrongMLP's residual pattern with a configurable number of hidden layers."""
 
-        def __init__(self, input_dim: int, hidden_dim: int, hidden_layers: int):
+        def __init__(self, input_dim: int, hidden_dim: int, hidden_layers: int,
+                     n_layers: int, hidden_size: int, pooling: str):
             super().__init__()
+            self.n_layers = n_layers
+            self.hidden_size = hidden_size
+            self.pooling = pooling
+            if pooling == "dwclp":
+                offsets = torch.arange(-args.dwclp_radius, args.dwclp_radius + 1,
+                                       dtype=torch.float32)
+                weights = torch.exp(-0.5 * (offsets / args.dwclp_sigma).square())
+                self.register_buffer("distance_kernel", (weights / weights.sum()).view(1, 1, -1))
             self.fc_in = nn.Linear(input_dim, hidden_dim)
             self.blocks = nn.ModuleList([
                 nn.Sequential(nn.LayerNorm(hidden_dim), nn.Mish(), nn.Dropout(0.2),
@@ -106,6 +125,25 @@ def main() -> None:
             self.out = nn.Linear(hidden_dim, 1)
 
         def forward(self, x):
+            if self.pooling != "none":
+                states = x.reshape(-1, self.n_layers, self.hidden_size)
+                if self.pooling == "max1d":
+                    states = F.max_pool1d(states.transpose(1, 2), kernel_size=3,
+                                          stride=2, padding=1).transpose(1, 2)
+                else:
+                    centers = torch.arange(0, self.n_layers, 2, device=x.device)
+                    previous = states.index_select(1, (centers - 1).clamp(min=0))
+                    following = states.index_select(1, (centers + 1).clamp(max=self.n_layers - 1))
+                    neighbors = torch.stack((previous, following), dim=2)
+                    flat = neighbors.reshape(-1, 1, self.hidden_size)
+                    flat = F.pad(flat, (args.dwclp_radius, args.dwclp_radius),
+                                 mode="replicate")
+                    smoothed = F.conv1d(flat, self.distance_kernel)
+                    smoothed = smoothed.reshape(states.shape[0], len(centers), 2,
+                                                self.hidden_size)
+                    states = (states.index_select(1, centers) +
+                              0.5 * smoothed[:, :, 0] + 0.5 * smoothed[:, :, 1]) / 2.0
+                x = states.reshape(states.shape[0], -1)
             h = self.fc_in(x)
             for block in self.blocks:
                 h = h + block(h)
@@ -144,7 +182,8 @@ def main() -> None:
     if len(target_features) != len(target_rows):
         raise ValueError("TriviaQA feature count mismatch")
     n_layers, hidden_size = target_features.shape[1:]
-    input_dim = n_layers * hidden_size
+    pooled_layers = n_layers if args.pooling == "none" else (n_layers + 1) // 2
+    input_dim = pooled_layers * hidden_size
     train_ds = RawStateDataset(bundles, "train")
     val_ds = RawStateDataset(bundles, "val")
     test_ds = RawStateDataset(bundles, "test")
@@ -155,7 +194,7 @@ def main() -> None:
         raise ValueError("Source splits must contain both BLEURT classes")
     print(f"Sources={source_names}; target={target_name}; source train/val/test="
           f"{len(train_ds)}/{len(val_ds)}/{len(test_ds)}; target={len(target_rows)}; "
-          f"raw MLP input={n_layers}*{hidden_size}={input_dim}", flush=True)
+          f"pooling={args.pooling}; MLP input={pooled_layers}*{hidden_size}={input_dim}", flush=True)
 
     seed_everything(args.seed)
     device = torch.device(args.train_device if torch.cuda.is_available() else "cpu")
@@ -165,7 +204,8 @@ def main() -> None:
     test_loader = DataLoader(test_ds, batch_size=256, shuffle=False, pin_memory=pin, num_workers=0)
     target_loader = DataLoader(TargetDataset(target_features), batch_size=256, shuffle=False,
                                pin_memory=pin, num_workers=0)
-    model = RawConcatMLP(input_dim, args.hidden_dim, args.hidden_layers).to(device)
+    model = RawConcatMLP(input_dim, args.hidden_dim, args.hidden_layers,
+                         n_layers, hidden_size, args.pooling).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     loss_fn = nn.BCEWithLogitsLoss()
     checkpoint = output_dir / "training_checkpoint.pt"
@@ -174,7 +214,10 @@ def main() -> None:
         saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
         if (saved["input_dim"] != input_dim or saved["seed"] != args.seed
                 or saved["hidden_dim"] != args.hidden_dim
-                or saved["hidden_layers"] != args.hidden_layers):
+                or saved["hidden_layers"] != args.hidden_layers
+                or saved.get("pooling", "none") != args.pooling
+                or saved.get("dwclp_radius", args.dwclp_radius) != args.dwclp_radius
+                or saved.get("dwclp_sigma", args.dwclp_sigma) != args.dwclp_sigma):
             raise ValueError("Checkpoint configuration mismatch")
         model.load_state_dict(saved["model"])
         optimizer.load_state_dict(saved["optimizer"])
@@ -199,11 +242,15 @@ def main() -> None:
         if val_auc > best_auc:
             best_auc, best_epoch = val_auc, epoch + 1
             save_checkpoint(best_path, {"input_dim": input_dim, "hidden_dim": args.hidden_dim,
-                                        "hidden_layers": args.hidden_layers, "model": model.state_dict(),
+                                        "hidden_layers": args.hidden_layers, "pooling": args.pooling,
+                                        "model": model.state_dict(),
                                         "best_epoch": best_epoch, "best_auc": best_auc})
         save_checkpoint(checkpoint, {"input_dim": input_dim, "seed": args.seed,
                                      "hidden_dim": args.hidden_dim,
                                      "hidden_layers": args.hidden_layers,
+                                     "pooling": args.pooling,
+                                     "dwclp_radius": args.dwclp_radius,
+                                     "dwclp_sigma": args.dwclp_sigma,
                                      "next_epoch": epoch + 1, "model": model.state_dict(),
                                      "optimizer": optimizer.state_dict(), "best_auc": best_auc,
                                      "best_epoch": best_epoch})
@@ -227,6 +274,7 @@ def main() -> None:
     ):
         judged = bleurt[str(row["id"])]
         results.append({**row, "setting": "G14_6SRC_RAW_CONCAT", "source_domains": source_names,
+                        "pooling_method": args.pooling, "pooled_layers": pooled_layers,
                         "mlp_hidden_dimension": args.hidden_dim,
                         "mlp_hidden_layers": args.hidden_layers,
                         "target_domain": target_name, "ground_truth_text": judged["ground_truth_text"],
@@ -237,8 +285,18 @@ def main() -> None:
     summary = {
         "setting": "G14_6SRC_RAW_CONCAT", "source_domains": source_names,
         "target_domain": target_name, "model": "Qwen/Qwen2.5-7B-Instruct",
-        "feature_policy": "flatten and concatenate all saved answer-token hidden states; no projection or scaling",
+        "feature_policy": (
+            "flatten and concatenate all saved answer-token hidden states; no projection or scaling"
+            if args.pooling == "none" else
+            "pool saved answer-token hidden states across layers, then flatten; no learned projection"
+        ),
         "num_layers_including_embedding_output": n_layers, "hidden_size": hidden_size,
+        "pooling_method": args.pooling, "pooled_layers": pooled_layers,
+        "pool_kernel_size": args.pool_kernel_size if args.pooling != "none" else None,
+        "pool_stride": args.pool_stride if args.pooling != "none" else None,
+        "dwclp_radius": args.dwclp_radius if args.pooling == "dwclp" else None,
+        "dwclp_sigma": args.dwclp_sigma if args.pooling == "dwclp" else None,
+        "dwclp_neighbor_weight": 0.5 if args.pooling == "dwclp" else None,
         "mlp_input_dimension": input_dim, "mlp_hidden_dimension": args.hidden_dim,
         "mlp_hidden_layers": args.hidden_layers,
         "mlp_activation": "mish", "mlp_dropout": 0.2,
