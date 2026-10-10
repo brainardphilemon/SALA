@@ -68,6 +68,33 @@ class RawStateDataset:
         return vector.reshape(-1).copy(), np.float32(label)
 
 
+def fit_layer_pca(bundles: list[dict], n_layers: int, hidden_size: int,
+                  components: int, fit_samples: int, seed: int):
+    """Fit PCA across layers using only source-training feature observations."""
+    if components > n_layers:
+        raise ValueError(f"PCA components ({components}) exceed available layers ({n_layers})")
+    domain_ids = np.concatenate([
+        np.full(len(bundle["train_idx"]), domain_id, dtype=np.int16)
+        for domain_id, bundle in enumerate(bundles)
+    ])
+    row_ids = np.concatenate([bundle["train_idx"] for bundle in bundles])
+    rng = np.random.default_rng(seed)
+    picked = rng.integers(len(row_ids), size=fit_samples)
+    picked_hidden = rng.integers(hidden_size, size=fit_samples)
+    observations = np.empty((fit_samples, n_layers), dtype=np.float32)
+    for domain_id, bundle in enumerate(bundles):
+        mask = domain_ids[picked] == domain_id
+        if not mask.any():
+            continue
+        rows = row_ids[picked[mask]]
+        hidden_ids = picked_hidden[mask]
+        observations[mask] = np.asarray(bundle["features"][rows, :, hidden_ids], dtype=np.float32)
+    pca = PCA(n_components=components, svd_solver="randomized", random_state=seed)
+    pca.fit(observations)
+    return (pca.components_.astype(np.float32), pca.mean_.astype(np.float32),
+            pca.explained_variance_ratio_.astype(np.float64))
+
+
 def predict(model, loader, device):
     import torch
 
@@ -90,12 +117,16 @@ def main() -> None:
     parser.add_argument("--hidden-dim", type=int, default=1024)
     parser.add_argument("--hidden-layers", type=int, default=3,
                         help="Number of width-matched hidden linear layers, excluding the output layer")
-    parser.add_argument("--pooling", choices=("none", "dwclp", "max1d", "max_mean", "logsumexp1d", "prev_same_index"), default="none")
+    parser.add_argument("--pooling", choices=("none", "dwclp", "max1d", "max_mean", "logsumexp1d", "pca_layers", "prev_same_index"), default="none")
     parser.add_argument("--pool-kernel-size", type=int, default=3)
     parser.add_argument("--pool-stride", type=int, default=2)
     parser.add_argument("--dwclp-radius", type=int, default=2)
     parser.add_argument("--dwclp-sigma", type=float, default=1.0)
     parser.add_argument("--previous-layer-weight", type=float, default=0.25)
+    parser.add_argument("--pca-components", type=int, default=15,
+                        help="Layer-axis PCA components for pca_layers pooling")
+    parser.add_argument("--pca-fit-samples", type=int, default=200_000,
+                        help="Number of source-train (example, hidden-index) observations used to fit PCA")
     args = parser.parse_args()
     if args.hidden_dim < 1 or args.hidden_layers < 1:
         parser.error("--hidden-dim and --hidden-layers must be positive")
@@ -107,8 +138,11 @@ def main() -> None:
         parser.error("--previous-layer-weight must be between 0 and 1")
     if args.dwclp_radius < 1 or args.dwclp_sigma <= 0:
         parser.error("DWCLP radius and sigma must be positive")
+    if args.pca_components < 1 or args.pca_fit_samples < 1:
+        parser.error("PCA component and fit-sample counts must be positive")
 
     import torch
+    from sklearn.decomposition import PCA
     from sklearn.metrics import roc_auc_score
     from torch import nn
     from torch.nn import functional as F
@@ -120,7 +154,8 @@ def main() -> None:
         """StrongMLP's residual pattern with a configurable number of hidden layers."""
 
         def __init__(self, input_dim: int, hidden_dim: int, hidden_layers: int,
-                     n_layers: int, hidden_size: int, pooling: str):
+                     n_layers: int, hidden_size: int, pooling: str,
+                     pca_components=None, pca_mean=None):
             super().__init__()
             self.n_layers = n_layers
             self.hidden_size = hidden_size
@@ -130,6 +165,11 @@ def main() -> None:
                                        dtype=torch.float32)
                 weights = torch.exp(-0.5 * (offsets / args.dwclp_sigma).square())
                 self.register_buffer("distance_kernel", (weights / weights.sum()).view(1, 1, -1))
+            if pooling == "pca_layers":
+                if pca_components is None or pca_mean is None:
+                    raise ValueError("PCA pooling requires fitted layer components and mean")
+                self.register_buffer("pca_components", torch.from_numpy(pca_components))
+                self.register_buffer("pca_mean", torch.from_numpy(pca_mean))
             self.fc_in = nn.Linear(input_dim, hidden_dim)
             self.blocks = nn.ModuleList([
                 nn.Sequential(nn.LayerNorm(hidden_dim), nn.Mish(), nn.Dropout(0.2),
@@ -158,6 +198,10 @@ def main() -> None:
                     channels_first = F.pad(states.transpose(1, 2), (1, 1), mode="replicate")
                     windows = channels_first.unfold(dimension=2, size=3, step=2)
                     states = torch.logsumexp(windows, dim=-1).transpose(1, 2)
+                elif self.pooling == "pca_layers":
+                    # PCA operates only over layers; every hidden coordinate shares the fitted basis.
+                    states = ((states.transpose(1, 2) - self.pca_mean)
+                              @ self.pca_components.T).transpose(1, 2)
                 elif self.pooling == "prev_same_index":
                     states = pool_previous_same_index(states, args.previous_layer_weight)
                 else:
@@ -212,7 +256,15 @@ def main() -> None:
     if len(target_features) != len(target_rows):
         raise ValueError("TriviaQA feature count mismatch")
     n_layers, hidden_size = target_features.shape[1:]
-    pooled_layers = n_layers if args.pooling == "none" else (n_layers + 1) // 2
+    pca_components = pca_mean = pca_variance_ratio = None
+    if args.pooling == "pca_layers":
+        pca_components, pca_mean, pca_variance_ratio = fit_layer_pca(
+            bundles, n_layers, hidden_size, args.pca_components, args.pca_fit_samples, args.seed
+        )
+        print(f"Fitted layer PCA on {args.pca_fit_samples} source-train observations; "
+              f"explained variance={pca_variance_ratio.sum():.6f}", flush=True)
+    pooled_layers = (args.pca_components if args.pooling == "pca_layers" else
+                     n_layers if args.pooling == "none" else (n_layers + 1) // 2)
     output_channels = 2 if args.pooling == "max_mean" else 1
     input_dim = output_channels * pooled_layers * hidden_size
     train_ds = RawStateDataset(bundles, "train")
@@ -236,7 +288,8 @@ def main() -> None:
     target_loader = DataLoader(TargetDataset(target_features), batch_size=256, shuffle=False,
                                pin_memory=pin, num_workers=0)
     model = RawConcatMLP(input_dim, args.hidden_dim, args.hidden_layers,
-                         n_layers, hidden_size, args.pooling).to(device)
+                         n_layers, hidden_size, args.pooling,
+                         pca_components=pca_components, pca_mean=pca_mean).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     loss_fn = nn.BCEWithLogitsLoss()
     checkpoint = output_dir / "training_checkpoint.pt"
@@ -309,6 +362,7 @@ def main() -> None:
         judged = bleurt[str(row["id"])]
         results.append({**row, "setting": "G14_6SRC_RAW_CONCAT", "source_domains": source_names,
                         "pooling_method": args.pooling, "pooled_layers": pooled_layers,
+                        "pca_components": args.pca_components if args.pooling == "pca_layers" else None,
                         "mlp_hidden_dimension": args.hidden_dim,
                         "mlp_hidden_layers": args.hidden_layers,
                         "target_domain": target_name, "ground_truth_text": judged["ground_truth_text"],
@@ -322,7 +376,9 @@ def main() -> None:
         "feature_policy": (
             "flatten and concatenate all saved answer-token hidden states; no projection or scaling"
             if args.pooling == "none" else
-            "pool saved answer-token hidden states across layers, then flatten; no learned projection"
+            ("fit source-train-only PCA across the layer axis, transform every hidden coordinate, then flatten"
+             if args.pooling == "pca_layers" else
+             "pool saved answer-token hidden states across layers, then flatten; no learned projection")
         ),
         "num_layers_including_embedding_output": n_layers, "hidden_size": hidden_size,
         "pooling_method": args.pooling, "pooled_layers": pooled_layers,
@@ -334,6 +390,11 @@ def main() -> None:
         "dwclp_sigma": args.dwclp_sigma if args.pooling == "dwclp" else None,
         "dwclp_neighbor_weight": 0.5 if args.pooling == "dwclp" else None,
         "previous_layer_weight": args.previous_layer_weight if args.pooling == "prev_same_index" else None,
+        "pca_fit_samples": args.pca_fit_samples if args.pooling == "pca_layers" else None,
+        "pca_explained_variance_ratio": (pca_variance_ratio.tolist()
+                                          if args.pooling == "pca_layers" else None),
+        "pca_explained_variance_total": (float(pca_variance_ratio.sum())
+                                           if args.pooling == "pca_layers" else None),
         "mlp_input_dimension": input_dim, "mlp_hidden_dimension": args.hidden_dim,
         "mlp_hidden_layers": args.hidden_layers,
         "mlp_activation": "mish", "mlp_dropout": 0.2,
