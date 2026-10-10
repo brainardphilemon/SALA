@@ -1,10 +1,12 @@
 """Six-source SALA ablation: a small vision-language model trained from scratch.
 
-The log-sum-exp pooled Qwen layer states are the "image": each of the 15 pooled layer vectors is
-a patch. A vision encoder (patch embedding + layer-position embedding + transformer) encodes them,
-an MLP projector maps them into the multimodal width, and a single-stream fusion transformer
-attends jointly over [CLS], the projected layer tokens, the question tokens and the generated
-answer tokens. A linear head on [CLS] predicts whether the answer is BLEURT-correct
+The saved answer-token hidden-state matrix (layers x hidden size, 29 x 3584 for Qwen2.5-7B) is the
+"image". It is standardized like image pixels, cut into ViT patches (default 1 layer x 256 hidden
+units), and encoded by a vision encoder (patch embedding + patch-position embedding +
+transformer). An MLP projector maps the patch tokens into the multimodal width, and a
+single-stream fusion transformer attends jointly over [CLS], the projected patch tokens, the
+question tokens and the generated answer tokens. `--image logsumexp` instead uses the 15
+log-sum-exp pooled layers as the image. A linear head on [CLS] predicts whether the answer is BLEURT-correct
 (non-hallucinated). Every weight is randomly initialized; only the Qwen tokenizer's vocabulary is
 reused, remapped to the token ids that occur in source-train text.
 """
@@ -39,7 +41,7 @@ from sala_vlm_fusion import logsumexp_pool
 TOKENIZER = "Qwen/Qwen2.5-7B-Instruct"
 TOKENIZER_REVISION = "a09a35458c702b33eeacc393d103063234e8bc28"
 PAD, UNK, CLS, SEP = 0, 1, 2, 3
-# Token types: pooled-layer patch, question text, answer text.
+# Token types: image patch, question text, answer text.
 PATCH_TYPE, QUESTION_TYPE, ANSWER_TYPE = 0, 1, 2
 # Tokenization happens before DataLoader workers fork.
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -62,13 +64,17 @@ def main() -> None:
     parser.add_argument("--vision-layers", type=int, default=2)
     parser.add_argument("--fusion-layers", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--image", choices=("raw", "logsumexp"), default="raw",
+                        help="raw: full layers x hidden matrix; logsumexp: 15 pooled layer windows")
+    parser.add_argument("--patch-height", type=int, default=1, help="Layers per image patch")
+    parser.add_argument("--patch-width", type=int, default=256, help="Hidden units per image patch")
     parser.add_argument("--max-question-tokens", type=int, default=96)
     parser.add_argument("--max-answer-tokens", type=int, default=48)
     parser.add_argument("--feature-clip", type=float, default=10.0,
-                        help="Clamp standardized pooled states to +/- this value")
+                        help="Clamp standardized image pixels to +/- this value")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--text-mode", choices=("full", "none"), default="full",
-                        help="'none' trains on the pooled-layer tokens only (text ablation)")
+                        help="'none' trains on the image patches only (text ablation)")
     parser.add_argument("--loss", choices=("bce", "focal"), default="bce")
     parser.add_argument("--focal-alpha", type=float, default=0.25)
     parser.add_argument("--focal-gamma", type=float, default=2.0)
@@ -79,6 +85,7 @@ def main() -> None:
     import torch
     from sklearn.metrics import roc_auc_score
     from torch import nn
+    from torch.nn import functional as F
     from torch.utils.data import DataLoader, Dataset
     from transformers import AutoTokenizer
 
@@ -109,7 +116,12 @@ def main() -> None:
     target_bundle = dict(name=target_name, rows=target_rows, labels=target_labels,
                          features=target_features, all_idx=np.arange(len(target_rows)))
     n_layers, hidden_size = target_features.shape[1:]
-    pooled_layers = (n_layers + 1) // 2
+    image_rows = n_layers if args.image == "raw" else (n_layers + 1) // 2
+    if hidden_size % args.patch_width:
+        parser.error(f"--patch-width must divide the hidden size {hidden_size}")
+    grid_rows = -(-image_rows // args.patch_height)
+    grid_cols = hidden_size // args.patch_width
+    num_patches = grid_rows * grid_cols
 
     # Text: Qwen BPE pieces, remapped to a compact vocabulary built from source-train rows only.
     text_start = time.perf_counter()
@@ -194,7 +206,8 @@ def main() -> None:
         raise ValueError("Source splits must contain both BLEURT classes")
     print(f"Sources={source_names}; target={target_name}; source train/val/test="
           f"{len(train_ds)}/{len(val_ds)}/{len(test_ds)}; target={len(target_ds)}; "
-          f"patches={pooled_layers}x{hidden_size}; text vocab={len(vocab) + 4}; "
+          f"image={args.image} {image_rows}x{hidden_size} -> {grid_rows}x{grid_cols}={num_patches} "
+          f"patches of {args.patch_height}x{args.patch_width}; text vocab={len(vocab) + 4}; "
           f"rows with truncated text={truncated}", flush=True)
 
     seed_everything(args.seed)
@@ -215,18 +228,22 @@ def main() -> None:
     test_loader = DataLoader(test_ds, batch_size=256, shuffle=False, **loader_kwargs)
     target_loader = DataLoader(target_ds, batch_size=256, shuffle=False, **loader_kwargs)
 
-    # Per-coordinate standardization of pooled states, fitted on source-train rows only.
-    total = torch.zeros(pooled_layers, hidden_size, dtype=torch.float64)
+    def make_image(states):
+        states = states.float()
+        return states if args.image == "raw" else logsumexp_pool(states)
+
+    # Per-pixel standardization of the image, fitted on source-train rows only.
+    total = torch.zeros(image_rows, hidden_size, dtype=torch.float64)
     total_sq = torch.zeros_like(total)
     with torch.inference_mode():
         for states, _, _, _ in DataLoader(train_ds, batch_size=256, shuffle=False, **loader_kwargs):
-            pooled = logsumexp_pool(states.to(device).float()).cpu().double()
-            total += pooled.sum(0)
-            total_sq += pooled.square().sum(0)
+            image = make_image(states.to(device)).cpu().double()
+            total += image.sum(0)
+            total_sq += image.square().sum(0)
     feature_mean = (total / len(train_ds)).float()
     feature_std = (total_sq / len(train_ds) - (total / len(train_ds)).square()).clamp(min=0).sqrt()
     feature_std = feature_std.float().clamp(min=1e-4)
-    print("Fitted pooled-state standardization on source-train rows", flush=True)
+    print("Fitted per-pixel image standardization on source-train rows", flush=True)
 
     def encoder(layers: int):
         layer = nn.TransformerEncoderLayer(args.model_dim, args.heads, 4 * args.model_dim,
@@ -241,9 +258,9 @@ def main() -> None:
             d = args.model_dim
             self.register_buffer("feature_mean", feature_mean.clone())
             self.register_buffer("feature_std", feature_std.clone())
-            # Vision encoder over the pooled layer "patches".
-            self.patch_embed = nn.Linear(hidden_size, d)
-            self.patch_pos = nn.Parameter(torch.zeros(1, pooled_layers, d))
+            # ViT-style vision encoder over the hidden-state image.
+            self.patch_embed = nn.Linear(args.patch_height * args.patch_width, d)
+            self.patch_pos = nn.Parameter(torch.zeros(1, num_patches, d))
             self.vision = encoder(args.vision_layers)
             # LLaVA-style MLP projector into the multimodal space.
             self.projector = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, d))
@@ -258,16 +275,20 @@ def main() -> None:
                 nn.init.trunc_normal_(parameter, std=0.02)
 
         def forward(self, states, token_ids, token_types):
-            pooled = logsumexp_pool(states.float())
-            pooled = ((pooled - self.feature_mean) / self.feature_std).clamp(-args.feature_clip,
-                                                                             args.feature_clip)
-            patches = self.vision(self.patch_embed(pooled) + self.patch_pos)
+            image = ((make_image(states) - self.feature_mean) / self.feature_std).clamp(
+                -args.feature_clip, args.feature_clip)
+            # Pad layers to a whole number of patch rows, then cut into non-overlapping patches.
+            image = F.pad(image, (0, 0, 0, grid_rows * args.patch_height - image_rows))
+            patches = image.reshape(-1, grid_rows, args.patch_height, grid_cols, args.patch_width)
+            patches = patches.permute(0, 1, 3, 2, 4).reshape(-1, num_patches,
+                                                             args.patch_height * args.patch_width)
+            patches = self.vision(self.patch_embed(patches) + self.patch_pos)
             patches = self.projector(patches) + self.type_embed.weight[PATCH_TYPE]
             text = (self.token_embed(token_ids) + self.text_pos[:, :token_ids.shape[1]]
                     + self.type_embed(token_types))
             batch = states.shape[0]
             sequence = torch.cat((self.cls.expand(batch, -1, -1), patches.to(text.dtype), text), dim=1)
-            fixed = torch.zeros(batch, 1 + pooled_layers, dtype=torch.bool, device=states.device)
+            fixed = torch.zeros(batch, 1 + num_patches, dtype=torch.bool, device=states.device)
             padding = torch.cat((fixed, token_ids == PAD), dim=1)
             hidden = self.fusion(sequence, src_key_padding_mask=padding)
             return self.head(hidden[:, 0]).squeeze(-1).float()
@@ -371,7 +392,7 @@ def main() -> None:
     ):
         judged = bleurt[str(row["id"])]
         results.append({**row, "setting": "G14_6SRC_SCRATCH_VLM", "source_domains": source_names,
-                        "pooling_method": "logsumexp1d", "pooled_layers": pooled_layers,
+                        "image": args.image, "image_patches": num_patches,
                         "target_domain": target_name, "ground_truth_text": judged["ground_truth_text"],
                         "ground_truth_label": int(label), "bleurt_score": float(judged["bleurt_score"]),
                         "raw_logit": float(logit), "sala_probability": float(score),
@@ -380,11 +401,12 @@ def main() -> None:
     summary = {
         "setting": "G14_6SRC_SCRATCH_VLM", "source_domains": source_names,
         "target_domain": target_name, "model": "Qwen/Qwen2.5-7B-Instruct",
-        "feature_policy": ("log-sum-exp pool saved answer-token hidden states over 3-layer, stride-2 "
-                           "windows; standardize per coordinate with source-train statistics; each "
-                           "pooled layer is one image patch"),
-        "architecture": ("vision encoder (patch embedding + layer positions + transformer) -> MLP "
-                         "projector -> single-stream fusion transformer over [CLS] + layer tokens + "
+        "feature_policy": (("full saved answer-token hidden-state matrix" if args.image == "raw" else
+                            "log-sum-exp pooled hidden states (3-layer windows, stride 2)")
+                           + " as a one-channel image; per-pixel standardization with source-train "
+                           "statistics; non-overlapping ViT patches"),
+        "architecture": ("ViT vision encoder (patch embedding + patch positions + transformer) -> MLP "
+                         "projector -> single-stream fusion transformer over [CLS] + patch tokens + "
                          "question + [SEP] + answer with modality/segment embeddings -> linear head "
                          "on [CLS]; all weights randomly initialized"),
         "text_tokenizer": f"{TOKENIZER}@{TOKENIZER_REVISION} BPE remapped to source-train vocabulary",
@@ -397,8 +419,9 @@ def main() -> None:
         "fusion_layers": args.fusion_layers, "dropout": args.dropout,
         "parameters": parameter_count,
         "num_layers_including_embedding_output": n_layers, "hidden_size": hidden_size,
-        "pooling_method": "logsumexp1d", "pooled_layers": pooled_layers,
-        "pool_kernel_size": 3, "pool_stride": 2, "feature_clip": args.feature_clip,
+        "image": args.image, "image_shape": [image_rows, hidden_size],
+        "patch_size": [args.patch_height, args.patch_width], "patch_grid": [grid_rows, grid_cols],
+        "image_patches": num_patches, "feature_clip": args.feature_clip,
         "epochs_erm": args.epochs_erm, "batch_size": args.batch_size,
         "learning_rate": args.learning_rate, "weight_decay": args.weight_decay,
         "warmup_ratio": args.warmup_ratio, "lr_schedule": "linear warmup then cosine decay",
