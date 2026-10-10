@@ -90,7 +90,7 @@ def main() -> None:
     parser.add_argument("--hidden-dim", type=int, default=1024)
     parser.add_argument("--hidden-layers", type=int, default=3,
                         help="Number of width-matched hidden linear layers, excluding the output layer")
-    parser.add_argument("--pooling", choices=("none", "dwclp", "max1d", "prev_same_index"), default="none")
+    parser.add_argument("--pooling", choices=("none", "dwclp", "max1d", "max_mean", "prev_same_index"), default="none")
     parser.add_argument("--pool-kernel-size", type=int, default=3)
     parser.add_argument("--pool-stride", type=int, default=2)
     parser.add_argument("--dwclp-radius", type=int, default=2)
@@ -99,7 +99,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.hidden_dim < 1 or args.hidden_layers < 1:
         parser.error("--hidden-dim and --hidden-layers must be positive")
-    if args.pooling in ("dwclp", "max1d") and (args.pool_kernel_size != 3 or args.pool_stride != 2):
+    if args.pooling in ("dwclp", "max1d", "max_mean") and (args.pool_kernel_size != 3 or args.pool_stride != 2):
         parser.error("Pooling comparison requires a 3-layer window and stride 2")
     if args.pooling == "prev_same_index" and args.pool_stride != 2:
         parser.error("Previous-layer pooling requires stride 2")
@@ -144,6 +144,14 @@ def main() -> None:
                 if self.pooling == "max1d":
                     states = F.max_pool1d(states.transpose(1, 2), kernel_size=3,
                                           stride=2, padding=1).transpose(1, 2)
+                elif self.pooling == "max_mean":
+                    channels_first = states.transpose(1, 2)
+                    maximum = F.max_pool1d(channels_first, kernel_size=3,
+                                           stride=2, padding=1)
+                    # count_include_pad=False avoids artificial zero-valued edge layers.
+                    average = F.avg_pool1d(channels_first, kernel_size=3,
+                                           stride=2, padding=1, count_include_pad=False)
+                    states = torch.cat((maximum, average), dim=1).transpose(1, 2)
                 elif self.pooling == "prev_same_index":
                     states = pool_previous_same_index(states, args.previous_layer_weight)
                 else:
@@ -199,7 +207,8 @@ def main() -> None:
         raise ValueError("TriviaQA feature count mismatch")
     n_layers, hidden_size = target_features.shape[1:]
     pooled_layers = n_layers if args.pooling == "none" else (n_layers + 1) // 2
-    input_dim = pooled_layers * hidden_size
+    output_channels = 2 if args.pooling == "max_mean" else 1
+    input_dim = output_channels * pooled_layers * hidden_size
     train_ds = RawStateDataset(bundles, "train")
     val_ds = RawStateDataset(bundles, "val")
     test_ds = RawStateDataset(bundles, "test")
@@ -210,7 +219,7 @@ def main() -> None:
         raise ValueError("Source splits must contain both BLEURT classes")
     print(f"Sources={source_names}; target={target_name}; source train/val/test="
           f"{len(train_ds)}/{len(val_ds)}/{len(test_ds)}; target={len(target_rows)}; "
-          f"pooling={args.pooling}; MLP input={pooled_layers}*{hidden_size}={input_dim}", flush=True)
+          f"pooling={args.pooling}; MLP input={output_channels}*{pooled_layers}*{hidden_size}={input_dim}", flush=True)
 
     seed_everything(args.seed)
     device = torch.device(args.train_device if torch.cuda.is_available() else "cpu")
@@ -311,6 +320,7 @@ def main() -> None:
         ),
         "num_layers_including_embedding_output": n_layers, "hidden_size": hidden_size,
         "pooling_method": args.pooling, "pooled_layers": pooled_layers,
+        "pooling_output_channels": output_channels,
         "pool_kernel_size": (2 if args.pooling == "prev_same_index" else
                              args.pool_kernel_size if args.pooling != "none" else None),
         "pool_stride": args.pool_stride if args.pooling != "none" else None,
