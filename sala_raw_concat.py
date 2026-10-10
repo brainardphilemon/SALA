@@ -90,7 +90,7 @@ def main() -> None:
     parser.add_argument("--hidden-dim", type=int, default=1024)
     parser.add_argument("--hidden-layers", type=int, default=3,
                         help="Number of width-matched hidden linear layers, excluding the output layer")
-    parser.add_argument("--pooling", choices=("none", "dwclp", "max1d", "max_mean", "prev_same_index"), default="none")
+    parser.add_argument("--pooling", choices=("none", "dwclp", "max1d", "max_mean", "logsumexp1d", "prev_same_index"), default="none")
     parser.add_argument("--pool-kernel-size", type=int, default=3)
     parser.add_argument("--pool-stride", type=int, default=2)
     parser.add_argument("--dwclp-radius", type=int, default=2)
@@ -99,7 +99,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.hidden_dim < 1 or args.hidden_layers < 1:
         parser.error("--hidden-dim and --hidden-layers must be positive")
-    if args.pooling in ("dwclp", "max1d", "max_mean") and (args.pool_kernel_size != 3 or args.pool_stride != 2):
+    if args.pooling in ("dwclp", "max1d", "max_mean", "logsumexp1d") and (args.pool_kernel_size != 3 or args.pool_stride != 2):
         parser.error("Pooling comparison requires a 3-layer window and stride 2")
     if args.pooling == "prev_same_index" and args.pool_stride != 2:
         parser.error("Previous-layer pooling requires stride 2")
@@ -152,6 +152,12 @@ def main() -> None:
                     average = F.avg_pool1d(channels_first, kernel_size=3,
                                            stride=2, padding=1, count_include_pad=False)
                     states = torch.cat((maximum, average), dim=1).transpose(1, 2)
+                elif self.pooling == "logsumexp1d":
+                    # Numerically stable soft maximum over each 3-layer window.
+                    # Replication gives every output a full three-layer window at the edges.
+                    channels_first = F.pad(states.transpose(1, 2), (1, 1), mode="replicate")
+                    windows = channels_first.unfold(dimension=2, size=3, step=2)
+                    states = torch.logsumexp(windows, dim=-1).transpose(1, 2)
                 elif self.pooling == "prev_same_index":
                     states = pool_previous_same_index(states, args.previous_layer_weight)
                 else:
