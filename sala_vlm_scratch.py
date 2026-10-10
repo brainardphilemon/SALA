@@ -15,6 +15,7 @@ import argparse
 import json
 import math
 import os
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -66,6 +67,8 @@ def main() -> None:
     parser.add_argument("--feature-clip", type=float, default=10.0,
                         help="Clamp standardized pooled states to +/- this value")
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--text-mode", choices=("full", "none"), default="full",
+                        help="'none' trains on the pooled-layer tokens only (text ablation)")
     parser.add_argument("--loss", choices=("bce", "focal"), default="bce")
     parser.add_argument("--focal-alpha", type=float, default=0.25)
     parser.add_argument("--focal-gamma", type=float, default=2.0)
@@ -109,6 +112,7 @@ def main() -> None:
     pooled_layers = (n_layers + 1) // 2
 
     # Text: Qwen BPE pieces, remapped to a compact vocabulary built from source-train rows only.
+    text_start = time.perf_counter()
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER, revision=TOKENIZER_REVISION)
     all_bundles = (*bundles, target_bundle)
     for bundle in all_bundles:
@@ -131,14 +135,27 @@ def main() -> None:
                           or len(answer) > args.max_answer_tokens)
             question = [vocab.get(i, UNK) for i in question[:args.max_question_tokens]]
             answer = [vocab.get(i, UNK) for i in answer[:args.max_answer_tokens]]
+            if args.text_mode == "none":
+                question, answer = [], []
             ids = question + [SEP] + answer
             types = [QUESTION_TYPE] * (len(question) + 1) + [ANSWER_TYPE] * len(answer)
             bundle["text"].append((ids, types))
     max_text_len = args.max_question_tokens + 1 + args.max_answer_tokens
+    text_lengths = [len(ids) for bundle in bundles for row_id in bundle["train_idx"]
+                    for ids in (bundle["text"][row_id][0],)]
+    example = bundles[0]
+    example_id = int(example["train_idx"][0])
+    print(f"Text mode={args.text_mode}; tokenized {sum(len(b['rows']) for b in all_bundles)} rows in "
+          f"{time.perf_counter() - text_start:.1f}s; source-train text tokens per row: "
+          f"mean={np.mean(text_lengths):.1f} max={max(text_lengths)}", flush=True)
+    print(f"Example {example['name']} train row: question={example['rows'][example_id]['input_text']!r} "
+          f"answer={example['rows'][example_id]['output_text']!r} -> "
+          f"{len(example['text'][example_id][0])} text tokens", flush=True)
 
     class VLMDataset(Dataset):
-        def __init__(self, split_bundles: list[dict], split: str):
+        def __init__(self, split_bundles: list[dict], split: str, mask_text: bool = False):
             self.bundles = split_bundles
+            self.mask_text = mask_text
             self.entries = [
                 (bundle_id, int(row_id), int(bundle["labels"][row_id]))
                 for bundle_id, bundle in enumerate(split_bundles)
@@ -152,7 +169,7 @@ def main() -> None:
             bundle_id, row_id, label = self.entries[position]
             bundle = self.bundles[bundle_id]
             states = np.asarray(bundle["features"][row_id], dtype=np.float16).copy()
-            ids, types = bundle["text"][row_id]
+            ids, types = ([SEP], [QUESTION_TYPE]) if self.mask_text else bundle["text"][row_id]
             return states, ids, types, np.float32(label)
 
     def collate(batch):
@@ -334,6 +351,16 @@ def main() -> None:
     target_logits = predict(target_loader)
     target_scores = 1 / (1 + np.exp(-np.clip(target_logits, -80, 80)))
     threshold, calibration = calibrate_threshold(val_scores.tolist(), y_val.tolist())
+    # Reliance check: score the trained model with the question/answer text blanked out.
+    masked_val_auc = masked_target_auc = None
+    if args.text_mode == "full":
+        masked_val_auc = float(roc_auc_score(y_val, predict(DataLoader(
+            VLMDataset(bundles, "val", mask_text=True), batch_size=256, shuffle=False, **loader_kwargs))))
+        masked_target_auc = float(roc_auc_score(target_labels, predict(DataLoader(
+            VLMDataset([target_bundle], "all", mask_text=True), batch_size=256, shuffle=False,
+            **loader_kwargs))))
+        print(f"Text-masked evaluation of the trained model: source_val_auc={masked_val_auc:.5f} "
+              f"target_auc={masked_target_auc:.5f}", flush=True)
     test_predictions = (test_scores >= threshold).astype(np.int64)
     target_predictions = (target_scores >= threshold).astype(np.int64)
     bleurt = {str(row["id"]): row for row in
@@ -361,7 +388,10 @@ def main() -> None:
                          "question + [SEP] + answer with modality/segment embeddings -> linear head "
                          "on [CLS]; all weights randomly initialized"),
         "text_tokenizer": f"{TOKENIZER}@{TOKENIZER_REVISION} BPE remapped to source-train vocabulary",
+        "text_mode": args.text_mode,
         "text_vocab_size": len(vocab) + 4, "text_rows_truncated": truncated,
+        "text_masked_source_val_auroc": masked_val_auc,
+        "text_masked_target_auroc": masked_target_auc,
         "max_question_tokens": args.max_question_tokens, "max_answer_tokens": args.max_answer_tokens,
         "model_dim": args.model_dim, "heads": args.heads, "vision_layers": args.vision_layers,
         "fusion_layers": args.fusion_layers, "dropout": args.dropout,
