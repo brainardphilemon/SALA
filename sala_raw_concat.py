@@ -26,6 +26,15 @@ from sala_kaggle import (
 SETTING = "G14_6SRC"
 
 
+def pool_previous_same_index(states, previous_weight: float = 0.25):
+    """Pair each even-indexed layer with its predecessor; keep layer zero intact."""
+    pooled = states[:, ::2, :].clone()
+    if states.shape[1] > 1:
+        pooled[:, 1:, :] = ((1.0 - previous_weight) * pooled[:, 1:, :]
+                            + previous_weight * states[:, 1:-1:2, :])
+    return pooled
+
+
 def save_checkpoint(path: Path, payload: dict) -> None:
     import torch
 
@@ -81,16 +90,21 @@ def main() -> None:
     parser.add_argument("--hidden-dim", type=int, default=1024)
     parser.add_argument("--hidden-layers", type=int, default=3,
                         help="Number of width-matched hidden linear layers, excluding the output layer")
-    parser.add_argument("--pooling", choices=("none", "dwclp", "max1d"), default="none")
+    parser.add_argument("--pooling", choices=("none", "dwclp", "max1d", "prev_same_index"), default="none")
     parser.add_argument("--pool-kernel-size", type=int, default=3)
     parser.add_argument("--pool-stride", type=int, default=2)
     parser.add_argument("--dwclp-radius", type=int, default=2)
     parser.add_argument("--dwclp-sigma", type=float, default=1.0)
+    parser.add_argument("--previous-layer-weight", type=float, default=0.25)
     args = parser.parse_args()
     if args.hidden_dim < 1 or args.hidden_layers < 1:
         parser.error("--hidden-dim and --hidden-layers must be positive")
-    if args.pooling != "none" and (args.pool_kernel_size != 3 or args.pool_stride != 2):
+    if args.pooling in ("dwclp", "max1d") and (args.pool_kernel_size != 3 or args.pool_stride != 2):
         parser.error("Pooling comparison requires a 3-layer window and stride 2")
+    if args.pooling == "prev_same_index" and args.pool_stride != 2:
+        parser.error("Previous-layer pooling requires stride 2")
+    if not 0.0 <= args.previous_layer_weight <= 1.0:
+        parser.error("--previous-layer-weight must be between 0 and 1")
     if args.dwclp_radius < 1 or args.dwclp_sigma <= 0:
         parser.error("DWCLP radius and sigma must be positive")
 
@@ -130,6 +144,8 @@ def main() -> None:
                 if self.pooling == "max1d":
                     states = F.max_pool1d(states.transpose(1, 2), kernel_size=3,
                                           stride=2, padding=1).transpose(1, 2)
+                elif self.pooling == "prev_same_index":
+                    states = pool_previous_same_index(states, args.previous_layer_weight)
                 else:
                     centers = torch.arange(0, self.n_layers, 2, device=x.device)
                     previous = states.index_select(1, (centers - 1).clamp(min=0))
@@ -216,6 +232,8 @@ def main() -> None:
                 or saved["hidden_dim"] != args.hidden_dim
                 or saved["hidden_layers"] != args.hidden_layers
                 or saved.get("pooling", "none") != args.pooling
+                or saved.get("previous_layer_weight", args.previous_layer_weight)
+                != args.previous_layer_weight
                 or saved.get("dwclp_radius", args.dwclp_radius) != args.dwclp_radius
                 or saved.get("dwclp_sigma", args.dwclp_sigma) != args.dwclp_sigma):
             raise ValueError("Checkpoint configuration mismatch")
@@ -249,6 +267,7 @@ def main() -> None:
                                      "hidden_dim": args.hidden_dim,
                                      "hidden_layers": args.hidden_layers,
                                      "pooling": args.pooling,
+                                     "previous_layer_weight": args.previous_layer_weight,
                                      "dwclp_radius": args.dwclp_radius,
                                      "dwclp_sigma": args.dwclp_sigma,
                                      "next_epoch": epoch + 1, "model": model.state_dict(),
@@ -292,11 +311,13 @@ def main() -> None:
         ),
         "num_layers_including_embedding_output": n_layers, "hidden_size": hidden_size,
         "pooling_method": args.pooling, "pooled_layers": pooled_layers,
-        "pool_kernel_size": args.pool_kernel_size if args.pooling != "none" else None,
+        "pool_kernel_size": (2 if args.pooling == "prev_same_index" else
+                             args.pool_kernel_size if args.pooling != "none" else None),
         "pool_stride": args.pool_stride if args.pooling != "none" else None,
         "dwclp_radius": args.dwclp_radius if args.pooling == "dwclp" else None,
         "dwclp_sigma": args.dwclp_sigma if args.pooling == "dwclp" else None,
         "dwclp_neighbor_weight": 0.5 if args.pooling == "dwclp" else None,
+        "previous_layer_weight": args.previous_layer_weight if args.pooling == "prev_same_index" else None,
         "mlp_input_dimension": input_dim, "mlp_hidden_dimension": args.hidden_dim,
         "mlp_hidden_layers": args.hidden_layers,
         "mlp_activation": "mish", "mlp_dropout": 0.2,
