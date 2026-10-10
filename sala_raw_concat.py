@@ -35,6 +35,19 @@ def pool_previous_same_index(states, previous_weight: float = 0.25):
     return pooled
 
 
+def sigmoid_focal_loss(logits, targets, alpha: float = 0.25, gamma: float = 2.0):
+    """Binary focal loss (Lin et al., 2017), mean-reduced; alpha weights the positive class."""
+    import torch.nn.functional as F
+
+    p = logits.sigmoid()
+    ce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    p_t = p * targets + (1 - p) * (1 - targets)
+    loss = ce * (1 - p_t) ** gamma
+    if alpha >= 0:
+        loss = (alpha * targets + (1 - alpha) * (1 - targets)) * loss
+    return loss.mean()
+
+
 def save_checkpoint(path: Path, payload: dict) -> None:
     import torch
 
@@ -125,6 +138,10 @@ def main() -> None:
     parser.add_argument("--previous-layer-weight", type=float, default=0.25)
     parser.add_argument("--pca-components", type=int, default=15,
                         help="Layer-axis PCA components for pca_layers pooling")
+    parser.add_argument("--loss", choices=("bce", "focal"), default="bce")
+    parser.add_argument("--focal-alpha", type=float, default=0.25,
+                        help="Positive-class weight for focal loss; negative disables alpha weighting")
+    parser.add_argument("--focal-gamma", type=float, default=2.0)
     parser.add_argument("--pca-fit-samples", type=int, default=200_000,
                         help="Number of source-train (example, hidden-index) observations used to fit PCA")
     args = parser.parse_args()
@@ -291,7 +308,11 @@ def main() -> None:
                          n_layers, hidden_size, args.pooling,
                          pca_components=pca_components, pca_mean=pca_mean).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    loss_fn = nn.BCEWithLogitsLoss()
+    if args.loss == "focal":
+        def loss_fn(logits, targets):
+            return sigmoid_focal_loss(logits, targets, args.focal_alpha, args.focal_gamma)
+    else:
+        loss_fn = nn.BCEWithLogitsLoss()
     checkpoint = output_dir / "training_checkpoint.pt"
     start_epoch, best_auc, best_epoch = 0, 0.0, None
     if checkpoint.exists():
@@ -300,6 +321,9 @@ def main() -> None:
                 or saved["hidden_dim"] != args.hidden_dim
                 or saved["hidden_layers"] != args.hidden_layers
                 or saved.get("pooling", "none") != args.pooling
+                or saved.get("loss", "bce") != args.loss
+                or saved.get("focal_alpha", args.focal_alpha) != args.focal_alpha
+                or saved.get("focal_gamma", args.focal_gamma) != args.focal_gamma
                 or saved.get("previous_layer_weight", args.previous_layer_weight)
                 != args.previous_layer_weight
                 or saved.get("dwclp_radius", args.dwclp_radius) != args.dwclp_radius
@@ -335,6 +359,8 @@ def main() -> None:
                                      "hidden_dim": args.hidden_dim,
                                      "hidden_layers": args.hidden_layers,
                                      "pooling": args.pooling,
+                                     "loss": args.loss, "focal_alpha": args.focal_alpha,
+                                     "focal_gamma": args.focal_gamma,
                                      "previous_layer_weight": args.previous_layer_weight,
                                      "dwclp_radius": args.dwclp_radius,
                                      "dwclp_sigma": args.dwclp_sigma,
@@ -368,7 +394,7 @@ def main() -> None:
                         "target_domain": target_name, "ground_truth_text": judged["ground_truth_text"],
                         "ground_truth_label": int(label), "bleurt_score": float(judged["bleurt_score"]),
                         "raw_logit": float(logit), "sala_probability": float(score),
-                        "predicted_label": int(predicted), "classifier_loss": "bce",
+                        "predicted_label": int(predicted), "classifier_loss": args.loss,
                         "sala_threshold": threshold, "split": "target_evaluation"})
     summary = {
         "setting": "G14_6SRC_RAW_CONCAT", "source_domains": source_names,
@@ -399,7 +425,9 @@ def main() -> None:
         "mlp_hidden_layers": args.hidden_layers,
         "mlp_activation": "mish", "mlp_dropout": 0.2,
         "epochs_erm": args.epochs_erm, "batch_size": 128, "learning_rate": 1e-3,
-        "weight_decay": 1e-4, "classifier_loss": "bce", "seed": args.seed,
+        "weight_decay": 1e-4, "classifier_loss": args.loss,
+        "focal_alpha": args.focal_alpha if args.loss == "focal" else None,
+        "focal_gamma": args.focal_gamma if args.loss == "focal" else None, "seed": args.seed,
         "bleurt_threshold": args.bleurt_threshold,
         "label_definition": "1 = BLEURT-correct/non-hallucinated; 0 = otherwise",
         "probability_definition": "sigmoid(raw MLP logit) for BLEURT-correct/non-hallucinated",
