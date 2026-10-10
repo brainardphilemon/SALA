@@ -36,6 +36,7 @@ DEFAULT_LM_REVISION = "7ae557604adf67be50417f59c2c2f167def9a775"
 PREFIX_TEXT = "Hidden states of the answering model:"
 # Tokenization happens before DataLoader workers fork.
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
 def logsumexp_pool(states):
@@ -215,6 +216,10 @@ def main() -> None:
             super().__init__()
             self.lm = AutoModel.from_pretrained(args.lm_model, revision=args.lm_revision,
                                                 torch_dtype=torch.float32)
+            # Recompute LM activations in backward and keep the vocabulary embeddings frozen so
+            # full fine-tuning fits a 16 GB T4.
+            self.lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            self.lm.get_input_embeddings().weight.requires_grad_(False)
             width = self.lm.config.hidden_size
             self.register_buffer("feature_mean", feature_mean.clone())
             self.register_buffer("feature_std", feature_std.clone())
@@ -242,7 +247,7 @@ def main() -> None:
             return self.head(last).squeeze(-1).float()
 
     model = HiddenStateVLM().to(device)
-    lm_params = list(model.lm.parameters())
+    lm_params = [param for param in model.lm.parameters() if param.requires_grad]
     new_params = list(model.projector.parameters()) + list(model.head.parameters())
     optimizer = torch.optim.AdamW([
         {"params": lm_params, "lr": args.lm_lr},
@@ -306,8 +311,10 @@ def main() -> None:
             running += float(loss.item()) * len(labels)
             seen += len(labels)
             if (step + 1) % 50 == 0:
+                peak = (f" peak_mem={torch.cuda.max_memory_allocated(device) / 2**30:.2f}GiB"
+                        if device.type == "cuda" else "")
                 print(f"epoch {epoch + 1} step {step + 1}/{steps_per_epoch} "
-                      f"loss={running / seen:.5f}", flush=True)
+                      f"loss={running / seen:.5f}{peak}", flush=True)
         val_auc = float(roc_auc_score(y_val, predict(val_loader)))
         if val_auc > best_auc:
             best_auc, best_epoch = val_auc, epoch + 1
@@ -364,6 +371,7 @@ def main() -> None:
         "lm_learning_rate": args.lm_lr, "projector_learning_rate": args.projector_lr,
         "weight_decay": args.weight_decay, "warmup_ratio": args.warmup_ratio,
         "lr_schedule": "linear warmup then cosine decay", "grad_clip_norm": 1.0,
+        "lm_gradient_checkpointing": True, "lm_input_embeddings_frozen": True,
         "mixed_precision": str(amp_dtype), "classifier_loss": args.loss,
         "focal_alpha": args.focal_alpha if args.loss == "focal" else None,
         "focal_gamma": args.focal_gamma if args.loss == "focal" else None, "seed": args.seed,
