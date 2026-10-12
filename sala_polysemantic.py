@@ -47,6 +47,8 @@ def main() -> None:
     parser.add_argument("--epochs-erm", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train-device", default="cuda:0")
+    parser.add_argument("--pooling", choices=("logsumexp1d", "none"), default="logsumexp1d",
+                        help="none: tokens are each neuron's raw trajectory over all saved layers")
     parser.add_argument("--encoder", choices=("perceiver", "full"), default="perceiver")
     parser.add_argument("--neuron-positions", choices=("learned", "none"), default="learned")
     parser.add_argument("--no-descriptors", dest="descriptors", action="store_false",
@@ -106,7 +108,7 @@ def main() -> None:
     if len(target_features) != len(target_rows):
         raise ValueError("TriviaQA feature count mismatch")
     n_layers, hidden_size = target_features.shape[1:]
-    pooled_layers = (n_layers + 1) // 2
+    pooled_layers = (n_layers + 1) // 2 if args.pooling == "logsumexp1d" else n_layers
 
     class TargetDataset(Dataset):
         def __init__(self, features):
@@ -149,7 +151,8 @@ def main() -> None:
     target_loader = DataLoader(TargetDataset(target_features), batch_size=256, shuffle=False, **loader_kwargs)
 
     def pool(flat):
-        return logsumexp_pool(flat.float().reshape(-1, n_layers, hidden_size))
+        states = flat.float().reshape(-1, n_layers, hidden_size)
+        return logsumexp_pool(states) if args.pooling == "logsumexp1d" else states
 
     # Per-coordinate (layer window x neuron) statistics, fitted on source-train rows only.
     total = torch.zeros(pooled_layers, hidden_size, dtype=torch.float64)
@@ -334,7 +337,7 @@ def main() -> None:
     ):
         judged = bleurt[str(row["id"])]
         results.append({**row, "setting": "G14_6SRC_POLYSEMANTIC", "source_domains": source_names,
-                        "pooling_method": "logsumexp1d", "pooled_layers": pooled_layers,
+                        "pooling_method": args.pooling, "pooled_layers": pooled_layers,
                         "target_domain": target_name, "ground_truth_text": judged["ground_truth_text"],
                         "ground_truth_label": int(label), "bleurt_score": float(judged["bleurt_score"]),
                         "raw_logit": float(logit), "sala_probability": float(score),
@@ -343,9 +346,11 @@ def main() -> None:
     summary = {
         "setting": "G14_6SRC_POLYSEMANTIC", "source_domains": source_names,
         "target_domain": target_name, "model": "Qwen/Qwen2.5-7B-Instruct",
-        "feature_policy": ("log-sum-exp pool saved answer-token hidden states over 3-layer, stride-2 windows; "
-                           "standardize per coordinate with source-train statistics; one token per hidden unit"),
-        "architecture": ("hidden-unit tokens (pooled-layer trajectory -> Linear(15, d) [+ per-neuron position] "
+        "feature_policy": (("log-sum-exp pool saved answer-token hidden states over 3-layer, stride-2 windows"
+                            if args.pooling == "logsumexp1d" else
+                            "raw saved answer-token hidden states over all layers, no pooling")
+                           + "; standardize per coordinate with source-train statistics; one token per hidden unit"),
+        "architecture": (f"hidden-unit tokens (layer trajectory -> Linear({pooled_layers}, d) [+ per-neuron position] "
                          "[+ neuron-descriptor embedding]) -> " + (
                              "[CLS] + pre-LN self-attention blocks -> [CLS] -> Linear(d, 512)"
                              if args.encoder == "full" else
@@ -356,8 +361,10 @@ def main() -> None:
         "neuron_descriptors": (["signed-log mean", "log std", "label correlation"]
                                if args.descriptors else None),
         "num_layers_including_embedding_output": n_layers, "hidden_size": hidden_size,
-        "pooling_method": "logsumexp1d", "pooled_layers": pooled_layers, "pool_kernel_size": 3,
-        "pool_stride": 2, "polysemantic_tokens": hidden_size, "token_length": pooled_layers,
+        "pooling_method": args.pooling, "pooled_layers": pooled_layers,
+        "pool_kernel_size": 3 if args.pooling == "logsumexp1d" else None,
+        "pool_stride": 2 if args.pooling == "logsumexp1d" else None,
+        "polysemantic_tokens": hidden_size, "token_length": pooled_layers,
         "positional_embedding": ("learned per neuron" if args.neuron_positions == "learned" else None),
         "model_dim": args.model_dim, "heads": args.heads,
         "transformer_blocks": args.blocks, "ffn_dim": args.ffn_dim, "embedding_dim": args.embedding_dim,
