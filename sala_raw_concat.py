@@ -141,6 +141,8 @@ def main() -> None:
     parser.add_argument("--feature-pca-dim", type=int, default=0,
                         help="If > 0, PCA (fitted on source-train) reduces the pooled, flattened features to "
                              "this many dimensions before the MLP")
+    parser.add_argument("--feature-pca-per-layer", action="store_true",
+                        help="Fit a separate --feature-pca-dim PCA for each pooled layer and concatenate")
     parser.add_argument("--loss", choices=("bce", "focal"), default="bce")
     parser.add_argument("--focal-alpha", type=float, default=0.25,
                         help="Positive-class weight for focal loss; negative disables alpha weighting")
@@ -324,25 +326,34 @@ def main() -> None:
             return torch.cat(chunks)
 
         # Fit PCA on source-train rows only, with its own RNG so training shuffles are unchanged.
+        # Per-layer mode fits one PCA per pooled layer (blocks of hidden_size features).
         train_x = pooled_features(DataLoader(train_ds, batch_size=256, shuffle=False, num_workers=0))
-        feature_mean = train_x.mean(0)
-        train_x -= feature_mean
-        total_variance = float(train_x.square().sum())
+        groups = ([slice(i * hidden_size, (i + 1) * hidden_size) for i in range(pooled_layers)]
+                  if args.feature_pca_per_layer else [slice(0, train_x.shape[1])])
+        means, bases, variances = [], [], []
         with torch.random.fork_rng(devices=[device] if device.type == "cuda" else []):
             torch.manual_seed(args.seed)
-            _, singular_values, basis = torch.svd_lowrank(train_x, q=args.feature_pca_dim, niter=4)
-        feature_pca_variance = (singular_values.square() / total_variance).cpu().numpy()
-        train_z = (train_x @ basis).cpu()
+            for group in groups:
+                block = train_x[:, group]
+                means.append(block.mean(0))
+                block -= means[-1]
+                _, singular_values, basis = torch.svd_lowrank(block, q=args.feature_pca_dim, niter=4)
+                bases.append(basis)
+                variances.append((singular_values.square() / block.square().sum()).cpu().numpy())
+        feature_pca_variance = np.concatenate(variances) / len(groups)
+        train_z = torch.cat([(train_x[:, g] @ b) for g, b in zip(groups, bases)], dim=1).cpu()
         del train_x
 
         def project(loader):
-            return ((pooled_features(loader) - feature_mean) @ basis).cpu()
+            x = pooled_features(loader)
+            return torch.cat([((x[:, g] - m) @ b) for g, m, b in zip(groups, means, bases)], dim=1).cpu()
 
         val_z, test_z = project(val_loader), project(test_loader)
         target_z = project(target_loader)
-        print(f"Fitted {args.feature_pca_dim}-component PCA on {len(train_z)} source-train rows of "
-              f"{input_dim} pooled features; explained variance={feature_pca_variance.sum():.4f}", flush=True)
-        input_dim = args.feature_pca_dim
+        print(f"Fitted {len(groups)} x {args.feature_pca_dim}-component PCA on {len(train_z)} source-train rows "
+              f"of {input_dim} pooled features; mean explained variance={feature_pca_variance.sum():.4f}",
+              flush=True)
+        input_dim = args.feature_pca_dim * len(groups)
         train_loader = DataLoader(TensorDataset(train_z, torch.from_numpy(y_train.astype(np.float32))),
                                   batch_size=128, shuffle=True, pin_memory=pin, num_workers=0)
         val_loader = DataLoader(TensorDataset(val_z, torch.from_numpy(y_val.astype(np.float32))),
@@ -469,6 +480,7 @@ def main() -> None:
         "pca_explained_variance_total": (float(pca_variance_ratio.sum())
                                            if args.pooling == "pca_layers" else None),
         "feature_pca_dim": args.feature_pca_dim or None,
+        "feature_pca_per_layer": bool(args.feature_pca_dim and args.feature_pca_per_layer),
         "feature_pca_explained_variance_total": (float(feature_pca_variance.sum())
                                                  if feature_pca_variance is not None else None),
         "mlp_input_dimension": input_dim, "mlp_hidden_dimension": args.hidden_dim,
