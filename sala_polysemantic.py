@@ -3,17 +3,23 @@
 The saved answer-token states (29 layers x hidden size) are log-sum-exp pooled over 3-layer,
 stride-2 windows exactly as in `sala_raw_concat.py --pooling logsumexp1d`, giving a 15 x hidden
 matrix. Each hidden unit then becomes one "polysemantic token": its 15-value trajectory across the
-pooled layers, standardized with source-train statistics, embedded by a shared Linear(15 -> d) plus
-a learned per-neuron positional embedding. A [CLS] token and the hidden-size neuron tokens pass
-through pre-LN transformer blocks; [CLS] is projected to a constant 512-d embedding, which feeds the
-same residual Mish MLP head as the 4 x 128 raw-concat runs. Optimizer, batch size, loss, split,
-checkpoint selection and threshold calibration match sala_raw_concat.py.
+pooled layers, standardized with source-train statistics, embedded by a shared Linear(15 -> d), plus
+an optional learned per-neuron positional embedding and an optional embedding of data-derived neuron
+descriptors (source-train mean, spread and label correlation per pooled layer).
+
+`--encoder perceiver` (default): learned latent tokens cross-attend to the neuron tokens (cost linear
+in the hidden size), pre-LN self-attention blocks run over the latents, and their mean is the
+constant embedding. `--encoder full`: a [CLS] token plus all neuron tokens go through pre-LN
+self-attention blocks and [CLS] is projected to the embedding. Either embedding feeds the same
+residual Mish MLP head as the 4 x 128 raw-concat runs; split, loss, batch size, checkpoint selection
+and threshold calibration match sala_raw_concat.py.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -41,12 +47,22 @@ def main() -> None:
     parser.add_argument("--epochs-erm", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train-device", default="cuda:0")
-    parser.add_argument("--model-dim", type=int, default=128)
+    parser.add_argument("--encoder", choices=("perceiver", "full"), default="perceiver")
+    parser.add_argument("--neuron-positions", choices=("learned", "none"), default="learned")
+    parser.add_argument("--no-descriptors", dest="descriptors", action="store_false",
+                        help="Disable the data-derived neuron descriptor embedding")
+    parser.add_argument("--latents", type=int, default=64, help="Perceiver latent tokens")
+    parser.add_argument("--latent-heads", type=int, default=8)
+    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--lr-schedule", choices=("cosine", "constant"), default="cosine",
+                        help="cosine = linear warmup then cosine decay")
+    parser.add_argument("--warmup-ratio", type=float, default=0.05)
+    parser.add_argument("--model-dim", type=int, default=128, help="Neuron-token width")
     parser.add_argument("--heads", type=int, default=4)
     parser.add_argument("--blocks", type=int, default=2)
     parser.add_argument("--ffn-dim", type=int, default=512)
     parser.add_argument("--embedding-dim", type=int, default=512,
-                        help="Constant output embedding fed to the MLP head")
+                        help="Constant output embedding fed to the MLP head (perceiver latent width)")
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--hidden-layers", type=int, default=4,
                         help="Hidden linear layers in the MLP head, as in the 4 x 128 runs")
@@ -57,8 +73,8 @@ def main() -> None:
     parser.add_argument("--focal-alpha", type=float, default=0.25)
     parser.add_argument("--focal-gamma", type=float, default=2.0)
     args = parser.parse_args()
-    if args.model_dim % args.heads:
-        parser.error("--model-dim must be divisible by --heads")
+    if args.model_dim % args.heads or args.embedding_dim % args.latent_heads:
+        parser.error("Model widths must be divisible by their head counts")
 
     import torch
     from sklearn.metrics import roc_auc_score
@@ -135,35 +151,68 @@ def main() -> None:
     def pool(flat):
         return logsumexp_pool(flat.float().reshape(-1, n_layers, hidden_size))
 
-    # Per-coordinate (layer window x neuron) standardization, fitted on source-train rows only.
+    # Per-coordinate (layer window x neuron) statistics, fitted on source-train rows only.
     total = torch.zeros(pooled_layers, hidden_size, dtype=torch.float64)
     total_sq = torch.zeros_like(total)
+    total_xy = torch.zeros_like(total)
     with torch.inference_mode():
-        for xb, _ in DataLoader(train_ds, batch_size=256, shuffle=False, **loader_kwargs):
+        for xb, yb in DataLoader(train_ds, batch_size=256, shuffle=False, **loader_kwargs):
             pooled = pool(xb.to(device)).cpu().double()
             total += pooled.sum(0)
             total_sq += pooled.square().sum(0)
-    feature_mean = (total / len(train_ds)).float()
-    feature_std = (total_sq / len(train_ds) - (total / len(train_ds)).square()).clamp(min=0).sqrt()
-    feature_std = feature_std.float().clamp(min=1e-4)
-    print("Fitted per-coordinate standardization on source-train rows", flush=True)
+            total_xy += (pooled * yb.double()[:, None, None]).sum(0)
+    n = len(train_ds)
+    mean64 = total / n
+    std64 = (total_sq / n - mean64.square()).clamp(min=0).sqrt()
+    feature_mean = mean64.float()
+    feature_std = std64.float().clamp(min=1e-4)
+    # Neuron descriptors (hidden x 3*layers): signed-log mean, log spread and point-biserial label
+    # correlation per pooled layer, standardized across neurons.
+    p = float(y_train.mean())
+    correlation = ((total_xy / n - mean64 * p) / (std64.clamp(min=1e-8) * math.sqrt(p * (1 - p)))).clamp(-1, 1)
+    descriptors = torch.cat((mean64.sign() * mean64.abs().log1p(), std64.clamp(min=1e-8).log(),
+                             correlation), dim=0).T.float()
+    descriptors = (descriptors - descriptors.mean(0)) / descriptors.std(0).clamp(min=1e-6)
+    print(f"Fitted per-coordinate standardization and {descriptors.shape[1]} neuron descriptors on "
+          f"source-train rows; max |label correlation|={correlation.abs().max():.3f}", flush=True)
 
     class PolysemanticTransformer(nn.Module):
         def __init__(self):
             super().__init__()
-            d = args.model_dim
+            d, width = args.model_dim, args.embedding_dim
             self.register_buffer("feature_mean", feature_mean.clone())
             self.register_buffer("feature_std", feature_std.clone())
             # One token per hidden unit: its pooled-layer trajectory (length 15) -> d.
             self.token_embed = nn.Linear(pooled_layers, d)
-            self.neuron_pos = nn.Parameter(torch.zeros(1, hidden_size, d))
-            self.cls = nn.Parameter(torch.zeros(1, 1, d))
+            self.neuron_pos = (nn.Parameter(torch.zeros(1, hidden_size, d))
+                               if args.neuron_positions == "learned" else None)
+            if args.descriptors:
+                self.register_buffer("descriptors", descriptors.clone())
+                self.descriptor_embed = nn.Sequential(nn.Linear(descriptors.shape[1], d), nn.GELU(),
+                                                      nn.Linear(d, d))
             self.input_dropout = nn.Dropout(args.dropout)
-            layer = nn.TransformerEncoderLayer(d, args.heads, args.ffn_dim, args.dropout, activation="gelu",
-                                               batch_first=True, norm_first=True)
-            self.blocks = nn.TransformerEncoder(layer, args.blocks, norm=nn.LayerNorm(d),
-                                                enable_nested_tensor=False)
-            self.to_embedding = nn.Linear(d, args.embedding_dim)
+            if args.encoder == "full":
+                self.cls = nn.Parameter(torch.zeros(1, 1, d))
+                layer = nn.TransformerEncoderLayer(d, args.heads, args.ffn_dim, args.dropout,
+                                                   activation="gelu", batch_first=True, norm_first=True)
+                self.blocks = nn.TransformerEncoder(layer, args.blocks, norm=nn.LayerNorm(d),
+                                                    enable_nested_tensor=False)
+                self.to_embedding = nn.Linear(d, width)
+                nn.init.trunc_normal_(self.cls, std=0.02)
+            else:
+                # Perceiver: latents read the neuron tokens by cross-attention, then self-attend.
+                self.token_norm = nn.LayerNorm(d)
+                self.latents = nn.Parameter(torch.zeros(1, args.latents, width))
+                self.cross_norm = nn.LayerNorm(width)
+                self.cross_attn = nn.MultiheadAttention(width, args.latent_heads, dropout=args.dropout,
+                                                        kdim=d, vdim=d, batch_first=True)
+                self.cross_ffn = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, 2 * width), nn.GELU(),
+                                               nn.Dropout(args.dropout), nn.Linear(2 * width, width))
+                layer = nn.TransformerEncoderLayer(width, args.latent_heads, 2 * width, args.dropout,
+                                                   activation="gelu", batch_first=True, norm_first=True)
+                self.blocks = nn.TransformerEncoder(layer, args.blocks, norm=nn.LayerNorm(width),
+                                                    enable_nested_tensor=False)
+                nn.init.trunc_normal_(self.latents, std=0.02)
             # MLP head: same residual pattern as RawConcatMLP in sala_raw_concat.py.
             self.fc_in = nn.Linear(args.embedding_dim, args.hidden_dim)
             self.head_blocks = nn.ModuleList([
@@ -172,17 +221,31 @@ def main() -> None:
                 for _ in range(args.hidden_layers - 1)
             ])
             self.out = nn.Linear(args.hidden_dim, 1)
-            nn.init.trunc_normal_(self.neuron_pos, std=0.02)
-            nn.init.trunc_normal_(self.cls, std=0.02)
+            if self.neuron_pos is not None:
+                nn.init.trunc_normal_(self.neuron_pos, std=0.02)
+
+        def neuron_tokens(self, flat):
+            pooled = ((pool(flat) - self.feature_mean) / self.feature_std).clamp(
+                -args.feature_clip, args.feature_clip)
+            tokens = self.token_embed(pooled.transpose(1, 2))
+            if self.neuron_pos is not None:
+                tokens = tokens + self.neuron_pos
+            if args.descriptors:
+                tokens = tokens + self.descriptor_embed(self.descriptors)
+            return self.input_dropout(tokens)
 
         def embed(self, flat):
             """Constant-size embedding: (batch, n_layers * hidden) -> (batch, embedding_dim)."""
-            pooled = ((pool(flat) - self.feature_mean) / self.feature_std).clamp(
-                -args.feature_clip, args.feature_clip)
-            tokens = self.token_embed(pooled.transpose(1, 2)) + self.neuron_pos
-            sequence = torch.cat((self.cls.expand(len(tokens), -1, -1), tokens), dim=1)
-            hidden = self.blocks(self.input_dropout(sequence))
-            return self.to_embedding(hidden[:, 0])
+            tokens = self.neuron_tokens(flat)
+            if args.encoder == "full":
+                sequence = torch.cat((self.cls.expand(len(tokens), -1, -1), tokens), dim=1)
+                return self.to_embedding(self.blocks(sequence)[:, 0])
+            tokens = self.token_norm(tokens)
+            latents = self.latents.expand(len(tokens), -1, -1)
+            attended, _ = self.cross_attn(self.cross_norm(latents), tokens, tokens, need_weights=False)
+            latents = latents + attended
+            latents = latents + self.cross_ffn(latents)
+            return self.blocks(latents).mean(1)
 
         def forward(self, flat):
             h = self.fc_in(self.embed(flat))
@@ -192,7 +255,19 @@ def main() -> None:
 
     model = PolysemanticTransformer().to(device)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
+    total_steps = len(train_loader) * args.epochs_erm
+    warmup_steps = max(1, int(args.warmup_ratio * total_steps))
+
+    def lr_lambda(step):
+        if args.lr_schedule == "constant":
+            return 1.0
+        if step < warmup_steps:
+            return (step + 1) / warmup_steps
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     scaler = torch.amp.GradScaler("cuda", enabled=amp_dtype == torch.float16)
     if args.loss == "focal":
         def loss_fn(logits, targets):
@@ -211,7 +286,8 @@ def main() -> None:
                 logits.append(model(xb.to(device, non_blocking=True)).float().cpu().numpy())
         return np.concatenate(logits).reshape(-1)
 
-    print(f"PolysemanticTransformer parameters={parameter_count:,}; tokens per example={hidden_size + 1}; "
+    print(f"PolysemanticTransformer encoder={args.encoder}; positions={args.neuron_positions}; "
+          f"descriptors={args.descriptors}; parameters={parameter_count:,}; neuron tokens={hidden_size}; "
           f"amp={amp_dtype}; steps/epoch={len(train_loader)}; epochs={args.epochs_erm}", flush=True)
     best_path = output_dir / "best_polysemantic.pt"
     best_auc, best_epoch = 0.0, None
@@ -230,6 +306,7 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
+            scheduler.step()
             total_loss += float(loss.item()) * len(yb)
         val_auc = float(roc_auc_score(y_val, predict(val_loader)))
         if val_auc > best_auc:
@@ -268,18 +345,29 @@ def main() -> None:
         "target_domain": target_name, "model": "Qwen/Qwen2.5-7B-Instruct",
         "feature_policy": ("log-sum-exp pool saved answer-token hidden states over 3-layer, stride-2 windows; "
                            "standardize per coordinate with source-train statistics; one token per hidden unit"),
-        "architecture": ("hidden-unit tokens (pooled-layer trajectory -> Linear(15, d) + learned per-neuron "
-                         "position) + [CLS] -> pre-LN transformer blocks -> [CLS] -> Linear(d, 512) -> "
-                         "residual Mish MLP head"),
+        "architecture": ("hidden-unit tokens (pooled-layer trajectory -> Linear(15, d) [+ per-neuron position] "
+                         "[+ neuron-descriptor embedding]) -> " + (
+                             "[CLS] + pre-LN self-attention blocks -> [CLS] -> Linear(d, 512)"
+                             if args.encoder == "full" else
+                             "Perceiver: latents cross-attend to neuron tokens, pre-LN latent self-attention "
+                             "blocks, mean over latents") + " -> residual Mish MLP head"),
+        "encoder": args.encoder, "latents": args.latents if args.encoder == "perceiver" else None,
+        "latent_heads": args.latent_heads if args.encoder == "perceiver" else None,
+        "neuron_descriptors": (["signed-log mean", "log std", "label correlation"]
+                               if args.descriptors else None),
         "num_layers_including_embedding_output": n_layers, "hidden_size": hidden_size,
         "pooling_method": "logsumexp1d", "pooled_layers": pooled_layers, "pool_kernel_size": 3,
         "pool_stride": 2, "polysemantic_tokens": hidden_size, "token_length": pooled_layers,
-        "positional_embedding": "learned per neuron", "model_dim": args.model_dim, "heads": args.heads,
+        "positional_embedding": ("learned per neuron" if args.neuron_positions == "learned" else None),
+        "model_dim": args.model_dim, "heads": args.heads,
         "transformer_blocks": args.blocks, "ffn_dim": args.ffn_dim, "embedding_dim": args.embedding_dim,
-        "readout": "[CLS]", "mlp_hidden_dimension": args.hidden_dim, "mlp_hidden_layers": args.hidden_layers,
+        "readout": "[CLS]" if args.encoder == "full" else "mean over latents",
+        "mlp_hidden_dimension": args.hidden_dim, "mlp_hidden_layers": args.hidden_layers,
         "mlp_activation": "mish", "dropout": args.dropout, "feature_clip": args.feature_clip,
         "parameters": parameter_count, "epochs_erm": args.epochs_erm, "batch_size": 128,
-        "learning_rate": 1e-3, "weight_decay": 1e-4, "lr_schedule": "constant", "grad_clip_norm": 1.0,
+        "learning_rate": args.learning_rate, "weight_decay": 1e-4,
+        "lr_schedule": ("constant" if args.lr_schedule == "constant" else
+                        f"linear warmup ({args.warmup_ratio:.0%}) then cosine decay"), "grad_clip_norm": 1.0,
         "mixed_precision": str(amp_dtype), "classifier_loss": args.loss, "seed": args.seed,
         "bleurt_threshold": args.bleurt_threshold,
         "label_definition": "1 = BLEURT-correct/non-hallucinated; 0 = otherwise",
