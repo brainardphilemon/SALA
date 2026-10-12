@@ -11,7 +11,8 @@ A small fusion transformer trained from scratch attends over [CLS] + layer token
 with modality embeddings, and a linear head on [CLS] predicts whether the answer is BLEURT-correct
 (non-hallucinated). Text tokens are dropped for a fraction of training samples (modality dropout)
 so the hidden-state branch stays useful on its own. `--mode image` / `--mode text` train the same
-model on one modality for comparison.
+model on one modality for comparison. `--finetune-text-encoder` puts the encoder inside the model
+and trains it end to end (at `--text-encoder-lr`) instead of using frozen precomputed states.
 """
 
 from __future__ import annotations
@@ -113,6 +114,9 @@ def main() -> None:
     parser.add_argument("--text-cache", default="/tmp/sala_text_embeddings.npz",
                         help="Reuse frozen text embeddings across runs ('' disables)")
     parser.add_argument("--max-text-tokens", type=int, default=64)
+    parser.add_argument("--finetune-text-encoder", action="store_true",
+                        help="Train the text encoder end to end instead of freezing it")
+    parser.add_argument("--text-encoder-lr", type=float, default=2e-5)
     parser.add_argument("--text-dropout", type=float, default=0.3,
                         help="Fraction of fused training samples whose text tokens are dropped")
     parser.add_argument("--batch-size", type=int, default=128)
@@ -176,7 +180,23 @@ def main() -> None:
     pin = device.type == "cuda"
 
     text_states, text_width = None, 0
-    if use_text:
+    finetune = use_text and args.finetune_text_encoder
+    if finetune:
+        from transformers import AutoConfig, AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(args.text_encoder, revision=args.text_encoder_revision)
+        for bundle in all_bundles:
+            encoded = tokenizer([row["input_text"] for row in bundle["rows"]],
+                                [row["output_text"] for row in bundle["rows"]],
+                                truncation=True, max_length=args.max_text_tokens)
+            bundle["text_tokens"] = [np.asarray([ids, types], dtype=np.int64) for ids, types
+                                     in zip(encoded["input_ids"], encoded["token_type_ids"])]
+        text_width = AutoConfig.from_pretrained(args.text_encoder,
+                                                revision=args.text_encoder_revision).hidden_size
+        train_lengths = np.asarray([b["text_tokens"][i].shape[1] for b in bundles for i in b["train_idx"]])
+        print(f"Trainable text encoder {args.text_encoder} (lr {args.text_encoder_lr}); source-train "
+              f"text tokens per row mean={train_lengths.mean():.1f} max={train_lengths.max()}", flush=True)
+    elif use_text:
         text_states, offsets, lengths = encode_text(all_bundles, args, device)
         for bundle, bundle_offsets, bundle_lengths in zip(all_bundles, offsets, lengths):
             bundle["text_offsets"], bundle["text_lengths"] = bundle_offsets, bundle_lengths
@@ -203,7 +223,9 @@ def main() -> None:
             bundle = self.bundles[bundle_id]
             states = (np.asarray(bundle["features"][row_id], dtype=np.float16).copy() if use_image
                       else np.zeros((0,), dtype=np.float16))
-            if use_text:
+            if finetune:
+                text = bundle["text_tokens"][row_id]
+            elif use_text:
                 start = int(bundle["text_offsets"][row_id])
                 text = text_states[start:start + int(bundle["text_lengths"][row_id])].copy()
             else:
@@ -212,12 +234,19 @@ def main() -> None:
 
     def collate(batch):
         states = torch.from_numpy(np.stack([item[0] for item in batch]))
-        lengths = torch.tensor([len(item[1]) for item in batch], dtype=torch.long)
-        text = torch.zeros(len(batch), int(lengths.max()) if use_text else 0, text_width,
-                           dtype=torch.float16)
-        for position, item in enumerate(batch):
-            if use_text:
-                text[position, :len(item[1])] = torch.from_numpy(item[1])
+        if finetune:
+            # (input_ids, token_type_ids) per row, right-padded with zeros.
+            lengths = torch.tensor([item[1].shape[1] for item in batch], dtype=torch.long)
+            text = torch.zeros(len(batch), 2, int(lengths.max()), dtype=torch.long)
+            for position, item in enumerate(batch):
+                text[position, :, :item[1].shape[1]] = torch.from_numpy(item[1])
+        else:
+            lengths = torch.tensor([len(item[1]) for item in batch], dtype=torch.long)
+            text = torch.zeros(len(batch), int(lengths.max()) if use_text else 0, text_width,
+                               dtype=torch.float16)
+            for position, item in enumerate(batch):
+                if use_text:
+                    text[position, :len(item[1])] = torch.from_numpy(item[1])
         labels = torch.tensor([item[2] for item in batch])
         return states, text, lengths, labels
 
@@ -282,6 +311,11 @@ def main() -> None:
                 self.layer_proj = nn.Linear(hidden_size, d)
                 self.layer_pos = nn.Parameter(torch.zeros(1, image_tokens, d))
                 nn.init.trunc_normal_(self.layer_pos, std=0.02)
+            if finetune:
+                from transformers import AutoModel
+
+                self.text_encoder = AutoModel.from_pretrained(args.text_encoder,
+                                                              revision=args.text_encoder_revision)
             if use_text:
                 self.text_proj = nn.Sequential(nn.LayerNorm(text_width), nn.Linear(text_width, d))
             self.input_dropout = nn.Dropout(args.dropout)
@@ -303,8 +337,11 @@ def main() -> None:
                 masks.append(torch.full((batch, image_tokens), drop_image, dtype=torch.bool,
                                         device=lengths.device))
             if use_text:
-                positions = torch.arange(text.shape[1], device=lengths.device)
+                positions = torch.arange(text.shape[-1] if finetune else text.shape[1], device=lengths.device)
                 text_mask = positions.unsqueeze(0) >= lengths.unsqueeze(1)
+                if finetune:
+                    text = self.text_encoder(input_ids=text[:, 0], token_type_ids=text[:, 1],
+                                             attention_mask=(~text_mask).long()).last_hidden_state
                 if drop_text is not None:
                     text_mask = text_mask | drop_text.unsqueeze(1)
                 parts.append(self.text_proj(text.float()) + self.type_embed.weight[1])
@@ -315,12 +352,14 @@ def main() -> None:
 
     model = FrozenTextFusion().to(device)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
-    decay, no_decay = [], []
+    groups = {}
     for name, parameter in model.named_parameters():
-        (no_decay if parameter.ndim < 2 or name in ("cls", "layer_pos") else decay).append(parameter)
-    optimizer = torch.optim.AdamW([{"params": decay, "weight_decay": args.weight_decay},
-                                   {"params": no_decay, "weight_decay": 0.0}],
-                                  lr=args.learning_rate)
+        no_decay = parameter.ndim < 2 or name in ("cls", "layer_pos")
+        lr = args.text_encoder_lr if name.startswith("text_encoder.") else args.learning_rate
+        groups.setdefault((lr, no_decay), []).append(parameter)
+    optimizer = torch.optim.AdamW([{"params": params, "lr": lr,
+                                    "weight_decay": 0.0 if no_decay else args.weight_decay}
+                                   for (lr, no_decay), params in groups.items()])
     total_steps = len(train_loader) * args.epochs_erm
     warmup_steps = max(1, int(args.warmup_ratio * total_steps))
 
@@ -411,6 +450,7 @@ def main() -> None:
     ):
         judged = bleurt[str(row["id"])]
         results.append({**row, "setting": "G14_6SRC_FROZEN_TEXT_FUSION", "mode": args.mode,
+                        "text_encoder_trainable": finetune,
                         "source_domains": source_names, "image": args.image,
                         "target_domain": target_name, "ground_truth_text": judged["ground_truth_text"],
                         "ground_truth_label": int(label), "bleurt_score": float(judged["bleurt_score"]),
@@ -421,12 +461,15 @@ def main() -> None:
         "setting": "G14_6SRC_FROZEN_TEXT_FUSION", "mode": args.mode, "source_domains": source_names,
         "target_domain": target_name, "model": "Qwen/Qwen2.5-7B-Instruct",
         "architecture": ("[CLS] + hidden-state layer tokens (shared linear projection + layer "
-                         "positions) + frozen pretrained text-encoder token states (LayerNorm + "
-                         "linear) with modality embeddings -> fusion transformer trained from "
-                         "scratch -> linear head on [CLS]"),
+                         "positions) + " + ("fine-tuned" if finetune else "frozen") + " pretrained "
+                         "text-encoder token states (LayerNorm + linear) with modality embeddings -> "
+                         "fusion transformer trained from scratch -> linear head on [CLS]"),
+        "text_encoder_trainable": finetune,
+        "text_encoder_lr": args.text_encoder_lr if finetune else None,
         "image": args.image if use_image else None, "image_tokens": image_tokens if use_image else None,
         "text_encoder": f"{args.text_encoder}@{args.text_encoder_revision}" if use_text else None,
-        "text_input": "frozen encoder over the (question, generated answer) sentence pair" if use_text else None,
+        "text_input": (("fine-tuned" if finetune else "frozen") + " encoder over the (question, generated "
+                       "answer) sentence pair") if use_text else None,
         "max_text_tokens": args.max_text_tokens, "text_dropout": text_dropout,
         "model_dim": args.model_dim, "heads": args.heads, "fusion_layers": args.fusion_layers,
         "dropout": args.dropout, "trainable_parameters": parameter_count,
