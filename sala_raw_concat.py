@@ -138,6 +138,9 @@ def main() -> None:
     parser.add_argument("--previous-layer-weight", type=float, default=0.25)
     parser.add_argument("--pca-components", type=int, default=15,
                         help="Layer-axis PCA components for pca_layers pooling")
+    parser.add_argument("--feature-pca-dim", type=int, default=0,
+                        help="If > 0, PCA (fitted on source-train) reduces the pooled, flattened features to "
+                             "this many dimensions before the MLP")
     parser.add_argument("--loss", choices=("bce", "focal"), default="bce")
     parser.add_argument("--focal-alpha", type=float, default=0.25,
                         help="Positive-class weight for focal loss; negative disables alpha weighting")
@@ -304,8 +307,52 @@ def main() -> None:
     test_loader = DataLoader(test_ds, batch_size=256, shuffle=False, pin_memory=pin, num_workers=0)
     target_loader = DataLoader(TargetDataset(target_features), batch_size=256, shuffle=False,
                                pin_memory=pin, num_workers=0)
+    feature_pca_variance = None
+    if args.feature_pca_dim:
+        if args.pooling != "logsumexp1d":
+            parser.error("--feature-pca-dim is implemented for --pooling logsumexp1d")
+        from torch.utils.data import TensorDataset
+
+        def pooled_features(loader):
+            """Same log-sum-exp 3-layer, stride-2 pooling as RawConcatMLP, flattened."""
+            chunks = []
+            with torch.inference_mode():
+                for xb, _ in loader:
+                    states = xb.to(device).reshape(-1, n_layers, hidden_size)
+                    windows = F.pad(states.transpose(1, 2), (1, 1), mode="replicate").unfold(2, 3, 2)
+                    chunks.append(torch.logsumexp(windows, dim=-1).transpose(1, 2).reshape(len(xb), -1))
+            return torch.cat(chunks)
+
+        # Fit PCA on source-train rows only, with its own RNG so training shuffles are unchanged.
+        train_x = pooled_features(DataLoader(train_ds, batch_size=256, shuffle=False, num_workers=0))
+        feature_mean = train_x.mean(0)
+        train_x -= feature_mean
+        total_variance = float(train_x.square().sum())
+        with torch.random.fork_rng(devices=[device] if device.type == "cuda" else []):
+            torch.manual_seed(args.seed)
+            _, singular_values, basis = torch.svd_lowrank(train_x, q=args.feature_pca_dim, niter=4)
+        feature_pca_variance = (singular_values.square() / total_variance).cpu().numpy()
+        train_z = (train_x @ basis).cpu()
+        del train_x
+
+        def project(loader):
+            return ((pooled_features(loader) - feature_mean) @ basis).cpu()
+
+        val_z, test_z = project(val_loader), project(test_loader)
+        target_z = project(target_loader)
+        print(f"Fitted {args.feature_pca_dim}-component PCA on {len(train_z)} source-train rows of "
+              f"{input_dim} pooled features; explained variance={feature_pca_variance.sum():.4f}", flush=True)
+        input_dim = args.feature_pca_dim
+        train_loader = DataLoader(TensorDataset(train_z, torch.from_numpy(y_train.astype(np.float32))),
+                                  batch_size=128, shuffle=True, pin_memory=pin, num_workers=0)
+        val_loader = DataLoader(TensorDataset(val_z, torch.from_numpy(y_val.astype(np.float32))),
+                                batch_size=256, shuffle=False, pin_memory=pin, num_workers=0)
+        test_loader = DataLoader(TensorDataset(test_z, torch.from_numpy(y_test.astype(np.float32))),
+                                 batch_size=256, shuffle=False, pin_memory=pin, num_workers=0)
+        target_loader = DataLoader(TensorDataset(target_z, torch.zeros(len(target_z))),
+                                   batch_size=256, shuffle=False, pin_memory=pin, num_workers=0)
     model = RawConcatMLP(input_dim, args.hidden_dim, args.hidden_layers,
-                         n_layers, hidden_size, args.pooling,
+                         n_layers, hidden_size, "none" if args.feature_pca_dim else args.pooling,
                          pca_components=pca_components, pca_mean=pca_mean).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     if args.loss == "focal":
@@ -421,6 +468,9 @@ def main() -> None:
                                           if args.pooling == "pca_layers" else None),
         "pca_explained_variance_total": (float(pca_variance_ratio.sum())
                                            if args.pooling == "pca_layers" else None),
+        "feature_pca_dim": args.feature_pca_dim or None,
+        "feature_pca_explained_variance_total": (float(feature_pca_variance.sum())
+                                                 if feature_pca_variance is not None else None),
         "mlp_input_dimension": input_dim, "mlp_hidden_dimension": args.hidden_dim,
         "mlp_hidden_layers": args.hidden_layers,
         "mlp_activation": "mish", "mlp_dropout": 0.2,
