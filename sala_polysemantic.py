@@ -47,8 +47,8 @@ def main() -> None:
     parser.add_argument("--epochs-erm", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train-device", default="cuda:0")
-    parser.add_argument("--pooling", choices=("logsumexp1d", "none"), default="logsumexp1d",
-                        help="none: tokens are each neuron's raw trajectory over all saved layers")
+    parser.add_argument("--pooling", choices=("logsumexp1d", "max1d", "none"), default="logsumexp1d",
+                        help="logsumexp1d / max1d: 3-layer windows, stride 2; none: raw trajectory over all layers")
     parser.add_argument("--encoder", choices=("perceiver", "full"), default="perceiver")
     parser.add_argument("--neuron-positions", choices=("learned", "none"), default="learned")
     parser.add_argument("--no-descriptors", dest="descriptors", action="store_false",
@@ -81,6 +81,7 @@ def main() -> None:
     import torch
     from sklearn.metrics import roc_auc_score
     from torch import nn
+    from torch.nn import functional as F
     from torch.utils.data import DataLoader, Dataset
 
     from utils.helpers import seed_everything
@@ -108,7 +109,7 @@ def main() -> None:
     if len(target_features) != len(target_rows):
         raise ValueError("TriviaQA feature count mismatch")
     n_layers, hidden_size = target_features.shape[1:]
-    pooled_layers = (n_layers + 1) // 2 if args.pooling == "logsumexp1d" else n_layers
+    pooled_layers = n_layers if args.pooling == "none" else (n_layers + 1) // 2
 
     class TargetDataset(Dataset):
         def __init__(self, features):
@@ -152,7 +153,12 @@ def main() -> None:
 
     def pool(flat):
         states = flat.float().reshape(-1, n_layers, hidden_size)
-        return logsumexp_pool(states) if args.pooling == "logsumexp1d" else states
+        if args.pooling == "logsumexp1d":
+            return logsumexp_pool(states)
+        if args.pooling == "max1d":
+            # Same 3-layer, stride-2 windows as sala_raw_concat.py --pooling max1d.
+            return F.max_pool1d(states.transpose(1, 2), kernel_size=3, stride=2, padding=1).transpose(1, 2)
+        return states
 
     # Per-coordinate (layer window x neuron) statistics, fitted on source-train rows only.
     total = torch.zeros(pooled_layers, hidden_size, dtype=torch.float64)
@@ -346,9 +352,10 @@ def main() -> None:
     summary = {
         "setting": "G14_6SRC_POLYSEMANTIC", "source_domains": source_names,
         "target_domain": target_name, "model": "Qwen/Qwen2.5-7B-Instruct",
-        "feature_policy": (("log-sum-exp pool saved answer-token hidden states over 3-layer, stride-2 windows"
-                            if args.pooling == "logsumexp1d" else
-                            "raw saved answer-token hidden states over all layers, no pooling")
+        "feature_policy": ({"logsumexp1d": "log-sum-exp pool saved answer-token hidden states over 3-layer, "
+                                           "stride-2 windows",
+                            "max1d": "max pool saved answer-token hidden states over 3-layer, stride-2 windows",
+                            "none": "raw saved answer-token hidden states over all layers, no pooling"}[args.pooling]
                            + "; standardize per coordinate with source-train statistics; one token per hidden unit"),
         "architecture": (f"hidden-unit tokens (layer trajectory -> Linear({pooled_layers}, d) [+ per-neuron position] "
                          "[+ neuron-descriptor embedding]) -> " + (
@@ -362,8 +369,8 @@ def main() -> None:
                                if args.descriptors else None),
         "num_layers_including_embedding_output": n_layers, "hidden_size": hidden_size,
         "pooling_method": args.pooling, "pooled_layers": pooled_layers,
-        "pool_kernel_size": 3 if args.pooling == "logsumexp1d" else None,
-        "pool_stride": 2 if args.pooling == "logsumexp1d" else None,
+        "pool_kernel_size": None if args.pooling == "none" else 3,
+        "pool_stride": None if args.pooling == "none" else 2,
         "polysemantic_tokens": hidden_size, "token_length": pooled_layers,
         "positional_embedding": ("learned per neuron" if args.neuron_positions == "learned" else None),
         "model_dim": args.model_dim, "heads": args.heads,
