@@ -315,41 +315,53 @@ def main() -> None:
             parser.error("--feature-pca-dim is implemented for --pooling logsumexp1d or none")
         from torch.utils.data import TensorDataset
 
+        feature_dim = (n_layers if args.pooling == "none" else pooled_layers) * hidden_size
+
         def pooled_features(loader):
-            """Same log-sum-exp 3-layer, stride-2 pooling as RawConcatMLP (or none), flattened."""
-            chunks = []
+            """Same log-sum-exp 3-layer, stride-2 pooling as RawConcatMLP (or none), flattened.
+
+            Kept in CPU memory (preallocated) so unpooled features don't exhaust the GPU.
+            """
+            out = torch.empty(len(loader.dataset), feature_dim)
+            position = 0
             with torch.inference_mode():
                 for xb, _ in loader:
                     if args.pooling == "none":
-                        chunks.append(xb.to(device).reshape(len(xb), -1))
-                        continue
-                    states = xb.to(device).reshape(-1, n_layers, hidden_size)
-                    windows = F.pad(states.transpose(1, 2), (1, 1), mode="replicate").unfold(2, 3, 2)
-                    chunks.append(torch.logsumexp(windows, dim=-1).transpose(1, 2).reshape(len(xb), -1))
-            return torch.cat(chunks)
+                        flat = xb.reshape(len(xb), -1)
+                    else:
+                        states = xb.to(device).reshape(-1, n_layers, hidden_size)
+                        windows = F.pad(states.transpose(1, 2), (1, 1), mode="replicate").unfold(2, 3, 2)
+                        flat = torch.logsumexp(windows, dim=-1).transpose(1, 2).reshape(len(xb), -1).cpu()
+                    out[position:position + len(xb)] = flat
+                    position += len(xb)
+            return out
 
         # Fit PCA on source-train rows only, with its own RNG so training shuffles are unchanged.
-        # Per-layer mode fits one PCA per pooled layer (blocks of hidden_size features).
+        # Per-layer mode fits one PCA per (pooled) layer; each block is moved to the GPU on its own.
         train_x = pooled_features(DataLoader(train_ds, batch_size=256, shuffle=False, num_workers=0))
-        groups = ([slice(i * hidden_size, (i + 1) * hidden_size) for i in range(pooled_layers)]
-                  if args.feature_pca_per_layer else [slice(0, train_x.shape[1])])
-        means, bases, variances = [], [], []
+        layer_count = feature_dim // hidden_size
+        groups = ([slice(i * hidden_size, (i + 1) * hidden_size) for i in range(layer_count)]
+                  if args.feature_pca_per_layer else [slice(0, feature_dim)])
+        means, bases, variances, train_parts = [], [], [], []
         with torch.random.fork_rng(devices=[device] if device.type == "cuda" else []):
             torch.manual_seed(args.seed)
             for group in groups:
-                block = train_x[:, group]
+                block = train_x[:, group].to(device)
                 means.append(block.mean(0))
                 block -= means[-1]
                 _, singular_values, basis = torch.svd_lowrank(block, q=args.feature_pca_dim, niter=4)
                 bases.append(basis)
                 variances.append((singular_values.square() / block.square().sum()).cpu().numpy())
+                train_parts.append((block @ basis).cpu())
+                del block
         feature_pca_variance = np.concatenate(variances) / len(groups)
-        train_z = torch.cat([(train_x[:, g] @ b) for g, b in zip(groups, bases)], dim=1).cpu()
-        del train_x
+        train_z = torch.cat(train_parts, dim=1)
+        del train_x, train_parts
 
         def project(loader):
             x = pooled_features(loader)
-            return torch.cat([((x[:, g] - m) @ b) for g, m, b in zip(groups, means, bases)], dim=1).cpu()
+            return torch.cat([((x[:, g].to(device) - m) @ b).cpu()
+                              for g, m, b in zip(groups, means, bases)], dim=1)
 
         val_z, test_z = project(val_loader), project(test_loader)
         target_z = project(target_loader)
