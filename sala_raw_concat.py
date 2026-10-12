@@ -311,15 +311,18 @@ def main() -> None:
                                pin_memory=pin, num_workers=0)
     feature_pca_variance = None
     if args.feature_pca_dim:
-        if args.pooling != "logsumexp1d":
-            parser.error("--feature-pca-dim is implemented for --pooling logsumexp1d")
+        if args.pooling not in ("logsumexp1d", "none"):
+            parser.error("--feature-pca-dim is implemented for --pooling logsumexp1d or none")
         from torch.utils.data import TensorDataset
 
         def pooled_features(loader):
-            """Same log-sum-exp 3-layer, stride-2 pooling as RawConcatMLP, flattened."""
+            """Same log-sum-exp 3-layer, stride-2 pooling as RawConcatMLP (or none), flattened."""
             chunks = []
             with torch.inference_mode():
                 for xb, _ in loader:
+                    if args.pooling == "none":
+                        chunks.append(xb.to(device).reshape(len(xb), -1))
+                        continue
                     states = xb.to(device).reshape(-1, n_layers, hidden_size)
                     windows = F.pad(states.transpose(1, 2), (1, 1), mode="replicate").unfold(2, 3, 2)
                     chunks.append(torch.logsumexp(windows, dim=-1).transpose(1, 2).reshape(len(xb), -1))
