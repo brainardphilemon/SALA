@@ -138,6 +138,8 @@ def main() -> None:
     parser.add_argument("--previous-layer-weight", type=float, default=0.25)
     parser.add_argument("--pca-components", type=int, default=15,
                         help="Layer-axis PCA components for pca_layers pooling")
+    parser.add_argument("--setting", choices=("G14_6SRC", "G15_6SRC"), default=SETTING,
+                        help="G14_6SRC: hold out TriviaQA; G15_6SRC: hold out NQ-Open")
     parser.add_argument("--feature-pca-dim", type=int, default=0,
                         help="If > 0, PCA (fitted on source-train) reduces the pooled, flattened features to "
                              "this many dimensions before the MLP")
@@ -262,8 +264,8 @@ def main() -> None:
         print("Completed output already exists; refusing to overwrite it", flush=True)
         return
 
-    source_names = list(SETTING_MAP[SETTING]["source"])
-    target_name = SETTING_MAP[SETTING]["target"]
+    source_names = list(SETTING_MAP[args.setting]["source"])
+    target_name = SETTING_MAP[args.setting]["target"]
     target_rows, target_labels = load_labels(target_name, args, artifact_dir)
     target_features = np.load(artifact_dir / "generation" / target_name / "features.npy", mmap_mode="r")
     bundles = []
@@ -272,11 +274,11 @@ def main() -> None:
         features = np.load(artifact_dir / "generation" / name / "features.npy", mmap_mode="r")
         if features.shape[1:] != target_features.shape[1:] or len(features) != len(rows):
             raise ValueError(f"Feature shape/count mismatch in {name}")
-        train_idx, val_idx, test_idx = source_split_indices(labels, SETTING, name)
+        train_idx, val_idx, test_idx = source_split_indices(labels, args.setting, name)
         bundles.append(dict(name=name, rows=rows, labels=labels, features=features,
                             train_idx=train_idx, val_idx=val_idx, test_idx=test_idx))
     if len(target_features) != len(target_rows):
-        raise ValueError("TriviaQA feature count mismatch")
+        raise ValueError(f"{target_name} feature count mismatch")
     n_layers, hidden_size = target_features.shape[1:]
     pca_components = pca_mean = pca_variance_ratio = None
     if args.pooling == "pca_layers":
@@ -459,7 +461,7 @@ def main() -> None:
         target_rows, target_labels, target_logits, target_scores, target_predictions
     ):
         judged = bleurt[str(row["id"])]
-        results.append({**row, "setting": "G14_6SRC_RAW_CONCAT", "source_domains": source_names,
+        results.append({**row, "setting": f"{args.setting}_RAW_CONCAT", "source_domains": source_names,
                         "pooling_method": args.pooling, "pooled_layers": pooled_layers,
                         "pca_components": args.pca_components if args.pooling == "pca_layers" else None,
                         "mlp_hidden_dimension": args.hidden_dim,
@@ -470,7 +472,7 @@ def main() -> None:
                         "predicted_label": int(predicted), "classifier_loss": args.loss,
                         "sala_threshold": threshold, "split": "target_evaluation"})
     summary = {
-        "setting": "G14_6SRC_RAW_CONCAT", "source_domains": source_names,
+        "setting": f"{args.setting}_RAW_CONCAT", "source_domains": source_names,
         "target_domain": target_name, "model": "Qwen/Qwen2.5-7B-Instruct",
         "feature_policy": (
             "flatten and concatenate all saved answer-token hidden states; no projection or scaling"
@@ -522,7 +524,7 @@ def main() -> None:
     csv_dump_atomic(output_dir / "results.csv", results)
     json_dump_atomic(output_dir / "summary.json", summary)
     print(json.dumps(summary, indent=2), flush=True)
-    print(f"Saved {len(results)} held-out TriviaQA rows to {output_dir / 'results.csv'}", flush=True)
+    print(f"Saved {len(results)} held-out {target_name} rows to {output_dir / 'results.csv'}", flush=True)
 
 
 if __name__ == "__main__":

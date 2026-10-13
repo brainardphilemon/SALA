@@ -44,6 +44,10 @@ SETTING_MAP = {
         "source": ["tqa", "nq_open", "sciq", "popqa", "web_questions", "hotpotqa"],
         "target": "triviaqa",
     },
+    "G15_6SRC": {
+        "source": ["tqa", "sciq", "popqa", "web_questions", "hotpotqa", "triviaqa"],
+        "target": "nq_open",
+    },
 }
 
 DATASET_SPECS = {
