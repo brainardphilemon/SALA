@@ -138,8 +138,8 @@ def main() -> None:
     parser.add_argument("--previous-layer-weight", type=float, default=0.25)
     parser.add_argument("--pca-components", type=int, default=15,
                         help="Layer-axis PCA components for pca_layers pooling")
-    parser.add_argument("--setting", choices=("G14_6SRC", "G15_6SRC"), default=SETTING,
-                        help="G14_6SRC: hold out TriviaQA; G15_6SRC: hold out NQ-Open")
+    parser.add_argument("--setting", choices=("G14_6SRC", "G15_6SRC", "G16_6SRC"), default=SETTING,
+                        help="G14_6SRC: hold out TriviaQA; G15_6SRC: hold out NQ-Open; G16_6SRC: hold out SciQA")
     parser.add_argument("--feature-pca-dim", type=int, default=0,
                         help="If > 0, PCA (fitted on source-train) reduces the pooled, flattened features to "
                              "this many dimensions before the MLP")
